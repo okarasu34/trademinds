@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from typing import Optional
 from loguru import logger
 from db.models import BotConfig, Trade, OrderStatus
-from db.redis_client import get_open_positions_count
+from bot.indicators import calculate_lot_size_from_risk
 
 
 @dataclass
@@ -64,21 +64,37 @@ class RiskManager:
                     reason=f"Daily loss limit hit ({daily_loss_pct:.1f}% >= {self.config.max_daily_loss_pct}%)"
                 )
 
-        # 4. Risk per trade limit
+        # 4. Risk per trade limit — recalculate using correct formula
         price_diff = abs(entry_price - stop_loss)
-        risk_amount = lot_size * price_diff * 100000  # approximate for forex
-        risk_pct = (risk_amount / account_balance) * 100 if account_balance > 0 else 999
-        if risk_pct > self.config.max_risk_per_trade_pct:
-            # Auto-adjust lot size to fit within limit
-            adjusted_lot = self._calculate_safe_lot(
-                account_balance, entry_price, stop_loss,
-                self.config.max_risk_per_trade_pct
-            )
-            logger.warning(
-                f"Risk {risk_pct:.2f}% > limit {self.config.max_risk_per_trade_pct}%. "
-                f"Adjusting lot from {lot_size} to {adjusted_lot}"
-            )
-            lot_size = adjusted_lot
+        if price_diff > 0 and account_balance > 0:
+            # Recalculate actual risk based on market type
+            if market_type == "forex":
+                risk_amount = lot_size * price_diff * 100_000
+            elif market_type == "crypto":
+                risk_amount = lot_size * price_diff
+            elif market_type in ("stock", "index"):
+                risk_amount = lot_size * price_diff
+            elif market_type == "commodity":
+                risk_amount = lot_size * price_diff * 100
+            else:
+                risk_amount = lot_size * price_diff * 100_000
+
+            risk_pct = (risk_amount / account_balance) * 100
+
+            if risk_pct > self.config.max_risk_per_trade_pct:
+                # Auto-adjust lot size to fit within limit using canonical function
+                adjusted_lot = calculate_lot_size_from_risk(
+                    account_balance=account_balance,
+                    risk_pct=self.config.max_risk_per_trade_pct,
+                    entry_price=entry_price,
+                    stop_loss=stop_loss,
+                    market_type=market_type,
+                )
+                logger.warning(
+                    f"Risk {risk_pct:.2f}% > limit {self.config.max_risk_per_trade_pct}%. "
+                    f"Adjusting lot from {lot_size} to {adjusted_lot}"
+                )
+                lot_size = adjusted_lot
 
         # 5. High-impact news pause
         if self.config.pause_on_high_impact_news and upcoming_news:
@@ -104,20 +120,6 @@ class RiskManager:
             )
 
         return RiskCheckResult(allowed=True, reason="All checks passed", adjusted_lot_size=lot_size)
-
-    def _calculate_safe_lot(
-        self,
-        balance: float,
-        entry: float,
-        stop_loss: float,
-        max_risk_pct: float,
-    ) -> float:
-        risk_amount = balance * (max_risk_pct / 100)
-        price_diff = abs(entry - stop_loss)
-        if price_diff == 0:
-            return 0.01
-        lot = risk_amount / (price_diff * 100000)
-        return round(max(0.01, min(lot, 100.0)), 2)
 
     def check_daily_limit_warning(self, account_balance: float) -> Optional[str]:
         """Returns warning message if approaching daily limit."""
