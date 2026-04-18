@@ -261,4 +261,9 @@ def get_broker_adapter(account: BrokerAccount) -> BrokerAdapter:
         from brokers.ibkr_adapter import IBKRAdapter
         return IBKRAdapter(account)
 
+    # Capital.com CFD broker
+    if broker_type in ["capital", "capital.com", "capitalcom"]:
+        from brokers.capital_adapter import CapitalAdapter
+        return CapitalAdapter(account)
+
     raise ValueError(f"Unsupported broker type: {broker_type}")

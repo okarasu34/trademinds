@@ -354,8 +354,22 @@ class TradingBot:
         return {"balance": balance, "equity": equity}
 
     def _get_symbols(self, strategy, market_type):
+        """Get symbols to trade - from strategy config or adapter watchlist"""
         if strategy.symbols:
             return strategy.symbols
+        
+        # For Capital.com, try to get symbols from watchlist
+        adapter = self.adapters.get(market_type)
+        if adapter and hasattr(adapter, 'get_watchlist_symbols'):
+            try:
+                # This will be cached in the adapter
+                symbols = adapter.get_cached_watchlist_symbols()
+                if symbols:
+                    return symbols
+            except Exception as e:
+                logger.warning(f"Failed to get watchlist symbols: {e}")
+        
+        # Fallback to default symbols
         return {
             "forex":     ["EURUSD", "GBPUSD", "USDJPY", "USDCHF", "USDCAD", "AUDUSD", "NZDUSD"],
             "crypto":    ["BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT", "XRP/USDT"],
