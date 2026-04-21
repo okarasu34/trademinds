@@ -40,18 +40,25 @@ class CapitalAdapter(BrokerAdapter):
         self._watchlist_cache_time: Optional[datetime] = None
 
     async def connect(self) -> bool:
-        """Login to Capital.com and get session tokens"""
+        """Login to Capital.com and get session tokens
+        
+        BrokerAccount fields:
+          encrypted_api_key    → Capital.com API Key (vajc0aJ...)
+          encrypted_api_secret → Account password
+          encrypted_extra      → Account identifier (email)
+        """
         try:
-            api_key = decrypt_credential(self.account.encrypted_api_key)
-            api_secret = decrypt_credential(self.account.encrypted_api_secret)
+            cap_api_key  = decrypt_credential(self.account.encrypted_api_key)    # API key
+            password     = decrypt_credential(self.account.encrypted_api_secret) # password
+            identifier   = decrypt_credential(self.account.encrypted_extra) if self.account.encrypted_extra else cap_api_key
             
             self.session = aiohttp.ClientSession()
             
             # Login
             async with self.session.post(
                 f"{self.BASE_URL}/session",
-                json={"identifier": api_key, "password": api_secret},
-                headers={"X-CAP-API-KEY": api_key}
+                json={"identifier": identifier, "password": password},
+                headers={"X-CAP-API-KEY": cap_api_key}
             ) as resp:
                 if resp.status != 200:
                     text = await resp.text()
