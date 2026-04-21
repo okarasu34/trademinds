@@ -4,15 +4,15 @@ from sqlalchemy import select, update
 from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime
+import asyncio
 
 from db.database import get_db
 from db.models import BotConfig, BotStatus, TradeMode, BotHealthLog, User
-from db.redis_client import get_bot_state, cache_get
+from db.redis_client import get_bot_state, cache_get, init_redis, redis_client
 from api.auth import get_current_user
 
 router = APIRouter()
 
-# In-memory bot registry (in production, use distributed task manager)
 _bot_registry: dict = {}
 
 
@@ -66,17 +66,20 @@ async def start_bot(
     if not config:
         raise HTTPException(status_code=404, detail="Bot config not found")
 
-    if config.status == BotStatus.RUNNING:
+    if config.status == BotStatus.RUNNING and user.id in _bot_registry:
         return {"message": "Bot already running"}
 
     config.status = BotStatus.RUNNING
     await db.commit()
 
-    # Import and start bot (lazy import to avoid circular deps)
+    # Ensure Redis is connected
+    global redis_client
+    if redis_client is None:
+        await init_redis()
+
     from bot.trading_bot import TradingBot
-    bot = TradingBot(user.id, db)
+    bot = TradingBot(str(user.id))
     _bot_registry[user.id] = bot
-    import asyncio
     asyncio.create_task(bot.start(config))
 
     return {"message": "Bot started", "mode": config.trade_mode.value}
@@ -149,7 +152,6 @@ async def set_trade_mode(
     result = await db.execute(select(BotConfig).where(BotConfig.user_id == user.id))
     config = result.scalar_one_or_none()
 
-    # Can only switch to live if bot is stopped
     if body.mode == TradeMode.LIVE and config.status == BotStatus.RUNNING:
         raise HTTPException(status_code=400, detail="Stop bot before switching to live mode")
 
@@ -179,7 +181,6 @@ async def reset_daily_stats(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Manually reset daily P&L counters (normally auto-reset at 00:00 UTC)."""
     result = await db.execute(select(BotConfig).where(BotConfig.user_id == user.id))
     config = result.scalar_one_or_none()
     config.daily_loss = 0.0
