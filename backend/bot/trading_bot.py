@@ -41,6 +41,12 @@ class TradingBot:
         self.config = config
         self.is_running = True
         logger.info(f"Bot starting | user={self.user_id} | mode={config.trade_mode.value}")
+
+        # Ensure Redis is connected
+        from db import redis_client as _rc_module
+        if _rc_module.redis_client is None:
+            await _rc_module.init_redis()
+
         await self._connect_brokers()
         await set_bot_state(self.user_id, {"status": "running", "started_at": datetime.utcnow().isoformat()})
         self._loop_task = asyncio.create_task(self._main_loop())
@@ -102,7 +108,9 @@ class TradingBot:
                 for market_type in (strategy.markets or []):
                     for symbol in self._get_symbols(strategy, market_type):
                         try:
-                            await self._analyze_and_trade(db, symbol, market_type, strategy, open_positions, account_info, upcoming_news, risk_manager)
+                            # Her sembol için ayrı DB session — transaction hatalarını önler
+                            async with AsyncSessionLocal() as sym_db:
+                                await self._analyze_and_trade(sym_db, symbol, market_type, strategy, open_positions, account_info, upcoming_news, risk_manager)
                             await asyncio.sleep(1)
                         except Exception as e:
                             logger.error(f"Error on {symbol}: {e}")
@@ -115,21 +123,17 @@ class TradingBot:
         try:
             tick = await adapter.get_tick(symbol)
             await set_live_price(symbol, tick.price, tick.bid, tick.ask)
-            # Entry timeframe: 1h (200 bars)
-            df_1h = await adapter.get_candles(symbol, "1h", 200)
-            # Higher timeframe: 4h for trend filter (100 bars = ~16 days)
+            df_1h = await adapter.get_candles(symbol, "1h", 500)
             df_4h = await adapter.get_candles(symbol, "4h", 100)
         except Exception as e:
             logger.warning(f"Data fetch failed {symbol}: {e}")
             return
 
-        # Entry timeframe indicators
         indicators = calculate_indicators(df_1h)
         patterns = detect_patterns(df_1h)
         if patterns:
             indicators["patterns"] = patterns
 
-        # Higher timeframe trend filter
         htf_indicators = calculate_indicators(df_4h) if df_4h is not None and len(df_4h) >= 50 else {}
         htf_trend = get_mtf_trend(htf_indicators)
         indicators["htf_trend_4h"] = htf_trend
@@ -137,9 +141,16 @@ class TradingBot:
         indicators["htf_ema50_4h"] = htf_indicators.get("ema_50")
         indicators["htf_ema200_4h"] = htf_indicators.get("ema_200")
 
-        # Apply strategy parameter filters so AI sees exact thresholds
         strategy_type = strategy.strategy_type.value if hasattr(strategy.strategy_type, "value") else str(strategy.strategy_type)
         indicators = apply_strategy_filters(indicators, strategy_type, strategy.parameters or {})
+
+        # Convert numpy types to Python native for JSON serialization
+        import numpy as np
+        indicators = {
+            k: (bool(v) if isinstance(v, np.bool_) else
+                float(v) if isinstance(v, (np.floating, np.integer)) else v)
+            for k, v in indicators.items() if v is not None
+        }
 
         symbol_events = await calendar_client.get_events_for_symbol(symbol, hours_ahead=4)
         news_items = [f"{e['title']} ({e['currency']}, {e['impact']}, in {e['minutes_until']:.0f}min)" for e in symbol_events]
@@ -166,7 +177,6 @@ class TradingBot:
         entry_price = tick.ask if signal["signal"] == "buy" else tick.bid
         atr = indicators.get("atr_14", entry_price * 0.01)
 
-        # FIX: Validate AI-provided SL/TP before using them
         raw_sl = signal.get("stop_loss", 0)
         raw_tp = signal.get("take_profit", 0)
         stop_loss, take_profit = validate_sl_tp(
@@ -177,7 +187,6 @@ class TradingBot:
             atr=atr,
         )
 
-        # FIX: Use correct lot size calculation based on SL distance, not AI's lot_size_pct
         lot_size = calculate_lot_size_from_risk(
             account_balance=account_info["balance"],
             risk_pct=self.config.max_risk_per_trade_pct,
@@ -215,7 +224,6 @@ class TradingBot:
             order_id = f"PAPER_{symbol}_{datetime.utcnow().strftime('%H%M%S')}"
 
         if order_id:
-            # Pass validated SL/TP into signal for _save_trade
             signal["stop_loss"] = stop_loss
             signal["take_profit"] = take_profit
             trade = await self._save_trade(db, broker_account.id, strategy.id, symbol, market_type, signal, entry_price, lot_size, order_id)
@@ -256,7 +264,11 @@ class TradingBot:
         return r.scalars().all()
 
     async def _get_broker_for_market(self, db: AsyncSession, market_type: str):
-        r = await db.execute(select(BrokerAccount).where(BrokerAccount.user_id == self.user_id, BrokerAccount.market_type == market_type, BrokerAccount.is_active == True, BrokerAccount.is_connected == True).limit(1))
+        r = await db.execute(select(BrokerAccount).where(
+            BrokerAccount.user_id == self.user_id,
+            BrokerAccount.is_active == True,
+            BrokerAccount.is_connected == True,
+        ).limit(1))
         return r.scalar_one_or_none()
 
     async def _save_trade(self, db, broker_id, strategy_id, symbol, market_type, signal, entry_price, lot_size, order_id) -> Trade:
@@ -291,15 +303,18 @@ class TradingBot:
         await publish(f"trades:{self.user_id}", {"event": "trade_closed", "trade_id": trade.id, "symbol": trade.symbol, "pnl": pnl, "closed_by": closed_by})
 
     async def _log_signal(self, db, symbol, market_type, signal):
-        log = AISignalLog(
-            user_id=self.user_id, symbol=symbol, market_type=market_type,
-            signal=signal["signal"], confidence=signal.get("confidence", 0),
-            reasoning=signal.get("reasoning"), indicators=signal.get("key_factors", []),
-            acted_on=signal["signal"] != "hold" and signal.get("confidence", 0) >= 0.65,
-            created_at=datetime.utcnow(),
-        )
-        db.add(log)
-        await db.commit()
+        try:
+            log = AISignalLog(
+                user_id=self.user_id, symbol=symbol, market_type=market_type,
+                signal=signal["signal"], confidence=signal.get("confidence", 0),
+                reasoning=signal.get("reasoning"), indicators=signal.get("key_factors", []),
+                acted_on=signal["signal"] != "hold" and signal.get("confidence", 0) >= 0.65,
+                created_at=datetime.utcnow(),
+            )
+            db.add(log)
+            await db.commit()
+        except Exception as e:
+            logger.warning(f"Signal log error {symbol}: {e}")
         await publish(f"signals:{self.user_id}", {"symbol": symbol, "signal": signal["signal"], "confidence": signal.get("confidence", 0)})
 
     async def _health_check(self):
@@ -354,26 +369,22 @@ class TradingBot:
         return {"balance": balance, "equity": equity}
 
     def _get_symbols(self, strategy, market_type):
-        """Get symbols to trade - from strategy config or adapter watchlist"""
         if strategy.symbols:
             return strategy.symbols
-        
-        # For Capital.com, try to get symbols from watchlist
+
         adapter = self.adapters.get(market_type)
-        if adapter and hasattr(adapter, 'get_watchlist_symbols'):
+        if adapter and hasattr(adapter, 'get_cached_watchlist_symbols'):
             try:
-                # This will be cached in the adapter
                 symbols = adapter.get_cached_watchlist_symbols()
                 if symbols:
                     return symbols
             except Exception as e:
                 logger.warning(f"Failed to get watchlist symbols: {e}")
-        
-        # Fallback to default symbols
+
         return {
             "forex":     ["EURUSD", "GBPUSD", "USDJPY", "USDCHF", "USDCAD", "AUDUSD", "NZDUSD"],
-            "crypto":    ["BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT", "XRP/USDT"],
-            "commodity": ["XAUUSD", "XAGUSD", "USOIL"],
+            "crypto":    ["BTCUSD", "ETHUSD", "SOLUSD", "XRPUSD", "LTCUSD"],
+            "commodity": ["GOLD", "SILVER", "OIL_BRENT"],
             "stock":     ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA"],
-            "index":     ["US500", "NAS100", "US30", "GER40"],
+            "index":     ["US500", "US30", "US100", "DE40"],
         }.get(market_type, [])
