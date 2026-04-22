@@ -13,11 +13,6 @@ class RiskCheckResult:
 
 
 class RiskManager:
-    """
-    Enforces all user-defined risk limits before any trade is executed.
-    This is the gatekeeper — no trade passes without its approval.
-    """
-
     def __init__(self, config: BotConfig):
         self.config = config
 
@@ -30,8 +25,8 @@ class RiskManager:
         entry_price: float,
         stop_loss: float,
         account_balance: float,
-        open_positions: list[Trade],
-        upcoming_news: list[dict],
+        open_positions: list,
+        upcoming_news: list,
     ) -> RiskCheckResult:
 
         # 1. Global position limit
@@ -44,8 +39,8 @@ class RiskManager:
 
         # 2. Per-market position limit
         market_limits = self.config.market_limits or {}
-        market_limit = market_limits.get(market_type, 999)
-        market_open = len([
+        market_limit  = market_limits.get(market_type, 999)
+        market_open   = len([
             t for t in open_positions
             if t.status == OrderStatus.OPEN and t.market_type.value == market_type
         ])
@@ -64,10 +59,9 @@ class RiskManager:
                     reason=f"Daily loss limit hit ({daily_loss_pct:.1f}% >= {self.config.max_daily_loss_pct}%)"
                 )
 
-        # 4. Risk per trade limit — recalculate using correct formula
+        # 4. Risk per trade limit
         price_diff = abs(entry_price - stop_loss)
         if price_diff > 0 and account_balance > 0:
-            # Recalculate actual risk based on market type
             if market_type == "forex":
                 risk_amount = lot_size * price_diff * 100_000
             elif market_type == "crypto":
@@ -82,7 +76,6 @@ class RiskManager:
             risk_pct = (risk_amount / account_balance) * 100
 
             if risk_pct > self.config.max_risk_per_trade_pct:
-                # Auto-adjust lot size to fit within limit using canonical function
                 adjusted_lot = calculate_lot_size_from_risk(
                     account_balance=account_balance,
                     risk_pct=self.config.max_risk_per_trade_pct,
@@ -100,7 +93,7 @@ class RiskManager:
         if self.config.pause_on_high_impact_news and upcoming_news:
             high_impact = [e for e in upcoming_news if e.get("impact") == "high"]
             if high_impact:
-                next_event = high_impact[0]
+                next_event    = high_impact[0]
                 minutes_until = next_event.get("minutes_until", 999)
                 if minutes_until <= self.config.news_pause_minutes:
                     return RiskCheckResult(
@@ -108,7 +101,7 @@ class RiskManager:
                         reason=f"High-impact news in {minutes_until}min: {next_event.get('title', 'Unknown')}"
                     )
 
-        # 6. Duplicate symbol check — don't open same symbol twice
+        # 6. Duplicate symbol check
         same_symbol_open = [
             t for t in open_positions
             if t.status == OrderStatus.OPEN and t.symbol == symbol
@@ -122,11 +115,10 @@ class RiskManager:
         return RiskCheckResult(allowed=True, reason="All checks passed", adjusted_lot_size=lot_size)
 
     def check_daily_limit_warning(self, account_balance: float) -> Optional[str]:
-        """Returns warning message if approaching daily limit."""
         if account_balance <= 0:
             return None
-        daily_loss_pct = (self.config.daily_loss / account_balance) * 100
-        warning_threshold = self.config.max_daily_loss_pct * 0.8  # 80% of limit
+        daily_loss_pct    = (self.config.daily_loss / account_balance) * 100
+        warning_threshold = self.config.max_daily_loss_pct * 0.8
         if daily_loss_pct >= warning_threshold:
             return (
                 f"WARNING: Daily loss at {daily_loss_pct:.1f}% "
@@ -137,6 +129,7 @@ class RiskManager:
     def should_emergency_stop(self, account_balance: float) -> bool:
         """Returns True if bot should stop all activity immediately."""
         if account_balance <= 0:
-            return True
+            # Don't stop on zero balance — broker may not have synced yet
+            return False
         daily_loss_pct = (self.config.daily_loss / account_balance) * 100
         return daily_loss_pct >= self.config.max_daily_loss_pct

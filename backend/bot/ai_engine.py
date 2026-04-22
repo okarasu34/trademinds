@@ -1,41 +1,9 @@
-import anthropic
-from core.config import settings
+"""
+AI Engine — Technical analysis without Anthropic API.
+Uses EMA + RSI + ADX combination.
+"""
 from loguru import logger
 from typing import Optional
-import json
-import pandas as pd
-import numpy as np
-
-
-client = anthropic.AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
-
-
-SYSTEM_PROMPT = """You are TradeMinds AI, an expert autonomous trading system.
-You analyze financial markets across Forex, Crypto, Commodities, Stocks, and Indices.
-
-Your role:
-- Analyze technical indicators, price action, market sentiment, and news events
-- Generate precise BUY, SELL, or HOLD signals with confidence scores
-- Provide clear reasoning for every decision
-- Apply the assigned trading strategy strictly
-- Respect risk parameters provided
-
-Always respond in valid JSON only. No markdown, no explanation outside JSON.
-
-JSON format:
-{
-  "signal": "buy" | "sell" | "hold",
-  "confidence": 0.0-1.0,
-  "entry_price": float or null,
-  "stop_loss": float,
-  "take_profit": float,
-  "lot_size_pct": 0.0-1.0,
-  "reasoning": "detailed explanation",
-  "key_factors": ["factor1", "factor2"],
-  "risk_level": "low" | "medium" | "high",
-  "expected_duration_hours": float
-}
-"""
 
 
 async def analyze_market(
@@ -44,8 +12,8 @@ async def analyze_market(
     strategy_name: str,
     strategy_params: dict,
     indicators: dict,
-    recent_news: list[str],
-    economic_events: list[dict],
+    recent_news: list,
+    economic_events: list,
     current_price: float,
     bid: float,
     ask: float,
@@ -58,132 +26,83 @@ async def analyze_market(
     max_risk_pct: float,
     ai_system_prompt_override: Optional[str] = None,
 ) -> dict:
-    """
-    Core AI analysis function.
-    Returns structured signal with entry, SL, TP, reasoning.
-    """
-
-    system = ai_system_prompt_override or SYSTEM_PROMPT
-
-    user_message = f"""
-MARKET ANALYSIS REQUEST
-=======================
-Symbol: {symbol}
-Market Type: {market_type}
-Current Price: {current_price}
-Bid: {bid} | Ask: {ask} | Spread: {spread:.5f}
-
-STRATEGY
---------
-Name: {strategy_name}
-Parameters: {json.dumps(strategy_params, indent=2)}
-
-TECHNICAL INDICATORS
---------------------
-{json.dumps(indicators, indent=2)}
-
-RECENT NEWS & SENTIMENT
------------------------
-{chr(10).join(f"- {n}" for n in recent_news) if recent_news else "No recent news"}
-
-UPCOMING ECONOMIC EVENTS (next 4 hours)
-----------------------------------------
-{json.dumps(economic_events, indent=2) if economic_events else "None"}
-
-ACCOUNT & RISK STATUS
----------------------
-Account Balance: {account_balance:.2f} USD
-Daily P&L: {daily_pnl:.2f} USD
-Daily Loss Limit: {max_daily_loss_pct}% of balance
-Max Risk Per Trade: {max_risk_pct}%
-Open Positions: {open_positions}/{max_positions}
-
-TASK
-----
-Analyze all data and provide a trading signal.
-If open positions are at max, signal HOLD unless a critical exit signal exists.
-If daily loss limit is near (within 1%), be very conservative.
-Adjust lot_size_pct based on confidence and risk environment.
-"""
-
     try:
-        response = await client.messages.create(
-            model=settings.ANTHROPIC_MODEL,
-            max_tokens=settings.ANTHROPIC_MAX_TOKENS,
-            system=system,
-            messages=[{"role": "user", "content": user_message}],
-        )
+        rsi       = indicators.get("rsi_14", 50)
+        adx       = indicators.get("adx", 0)
+        ema_fast  = indicators.get("ema_21", 0)
+        ema_slow  = indicators.get("ema_50", 0)
+        ema_long  = indicators.get("ema_200", 0)
+        atr       = indicators.get("atr_14", current_price * 0.01)
+        htf_trend = indicators.get("htf_trend_4h", "neutral")
 
-        raw = response.content[0].text.strip()
-        result = json.loads(raw)
-        logger.info(f"AI signal for {symbol}: {result['signal']} (confidence: {result['confidence']:.2f})")
-        return result
+        signal     = "hold"
+        confidence = 0.3
+        reason     = "No signal"
 
-    except json.JSONDecodeError as e:
-        logger.error(f"AI response JSON parse error for {symbol}: {e}")
-        return {"signal": "hold", "confidence": 0.0, "reasoning": "AI parse error", "risk_level": "high"}
+        if adx < 15:
+            return {"signal": "hold", "confidence": 0.2, "reason": "Low ADX — no trend",
+                    "stop_loss": 0, "take_profit": 0, "reasoning": "Low ADX", "key_factors": []}
+
+        ema_bull = ema_fast > ema_slow > 0
+        ema_bear = ema_fast < ema_slow and ema_slow > 0
+        htf_bull = htf_trend in ["strong_bull", "bull", "bullish"]
+        htf_bear = htf_trend in ["strong_bear", "bear", "bearish"]
+
+        # BUY
+        if (
+            ema_bull and
+            htf_bull and
+            28 < rsi < 68 and
+            adx > 18 and
+            (ema_long is None or ema_long == 0 or current_price > ema_long)
+        ):
+            signal     = "buy"
+            confidence = min(0.95, 0.65 + (adx - 18) / 100 + (68 - rsi) / 200)
+            reason     = f"EMA bull + HTF bull + RSI {rsi:.0f} + ADX {adx:.0f}"
+
+        # SELL
+        elif (
+            ema_bear and
+            htf_bear and
+            30 < rsi < 72 and
+            adx > 18 and
+            (ema_long is None or ema_long == 0 or current_price < ema_long)
+        ):
+            signal     = "sell"
+            confidence = min(0.95, 0.65 + (adx - 18) / 100 + (rsi - 30) / 200)
+            reason     = f"EMA bear + HTF bear + RSI {rsi:.0f} + ADX {adx:.0f}"
+
+        sl = tp = 0
+        if signal == "buy":
+            sl = round(current_price - atr * 2.0, 5)
+            tp = round(current_price + atr * 4.0, 5)
+        elif signal == "sell":
+            sl = round(current_price + atr * 2.0, 5)
+            tp = round(current_price - atr * 4.0, 5)
+
+        if signal != "hold":
+            logger.info(f"Signal {symbol}: {signal.upper()} | conf={confidence:.2f} | {reason}")
+
+        return {
+            "signal":     signal,
+            "confidence": round(confidence, 2),
+            "reason":     reason,
+            "reasoning":  reason,
+            "stop_loss":  sl,
+            "take_profit": tp,
+            "key_factors": [reason],
+            "risk_level": "medium",
+        }
+
     except Exception as e:
-        logger.error(f"AI analysis error for {symbol}: {e}")
-        return {"signal": "hold", "confidence": 0.0, "reasoning": str(e), "risk_level": "high"}
+        logger.error(f"Analysis error for {symbol}: {e}")
+        return {"signal": "hold", "confidence": 0.0, "reason": str(e),
+                "reasoning": str(e), "stop_loss": 0, "take_profit": 0, "key_factors": []}
 
 
-async def analyze_news_sentiment(
-    symbol: str,
-    currency: str,
-    news_headlines: list[str],
-) -> dict:
-    """Analyze news sentiment for a specific symbol/currency."""
-
-    response = await client.messages.create(
-        model=settings.ANTHROPIC_MODEL,
-        max_tokens=512,
-        system="You are a financial news sentiment analyzer. Respond in JSON only.",
-        messages=[{
-            "role": "user",
-            "content": f"""
-Analyze sentiment for {symbol} ({currency}) based on these headlines:
-{chr(10).join(f"- {h}" for h in news_headlines)}
-
-Respond as JSON:
-{{
-  "sentiment": "bullish" | "bearish" | "neutral",
-  "score": -1.0 to 1.0,
-  "key_themes": ["theme1"],
-  "impact_level": "low" | "medium" | "high"
-}}
-"""
-        }]
-    )
-
-    try:
-        return json.loads(response.content[0].text.strip())
-    except Exception:
-        return {"sentiment": "neutral", "score": 0.0, "key_themes": [], "impact_level": "low"}
+async def analyze_news_sentiment(symbol: str, currency: str, news_headlines: list) -> dict:
+    return {"sentiment": "neutral", "score": 0.0, "key_themes": [], "impact_level": "low"}
 
 
-async def generate_daily_market_brief(
-    market_summary: dict,
-    top_opportunities: list[dict],
-    economic_calendar: list[dict],
-) -> str:
-    """Generate a daily AI market brief for the dashboard."""
-
-    response = await client.messages.create(
-        model=settings.ANTHROPIC_MODEL,
-        max_tokens=1000,
-        system="You are a professional market analyst. Write concise, insightful daily briefs.",
-        messages=[{
-            "role": "user",
-            "content": f"""
-Write a professional daily market brief (max 300 words) covering:
-
-Market Summary: {json.dumps(market_summary)}
-Top Opportunities: {json.dumps(top_opportunities)}
-Today's Key Events: {json.dumps(economic_calendar)}
-
-Focus on actionable insights. Be concise and professional.
-"""
-        }]
-    )
-
-    return response.content[0].text.strip()
+async def generate_daily_market_brief(market_summary: dict, top_opportunities: list, economic_calendar: list) -> str:
+    return "Market brief unavailable — Anthropic not connected."
