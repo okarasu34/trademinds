@@ -264,17 +264,7 @@ class TradingBot:
         return r.scalars().all()
 
     async def _get_broker_for_market(self, db: AsyncSession, market_type: str):
-        # Try exact market type match first
-        r = await db.execute(select(BrokerAccount).where(
-            BrokerAccount.user_id == self.user_id,
-            BrokerAccount.is_active == True,
-            BrokerAccount.is_connected == True,
-            BrokerAccount.market_type == market_type,
-        ).limit(1))
-        result = r.scalar_one_or_none()
-        if result:
-            return result
-        # Fallback: any connected broker
+        # Return any connected broker (Capital.com handles all market types)
         r = await db.execute(select(BrokerAccount).where(
             BrokerAccount.user_id == self.user_id,
             BrokerAccount.is_active == True,
