@@ -42,7 +42,6 @@ class TradingBot:
         self.is_running = True
         logger.info(f"Bot starting | user={self.user_id} | mode={config.trade_mode.value}")
 
-        # Ensure Redis is connected
         from db import redis_client as _rc_module
         if _rc_module.redis_client is None:
             await _rc_module.init_redis()
@@ -89,7 +88,6 @@ class TradingBot:
             if not strategies:
                 return
 
-            open_positions = await self._get_open_positions(db)
             account_info = await self._get_consolidated_account()
             risk_manager = RiskManager(self.config)
 
@@ -104,51 +102,67 @@ class TradingBot:
 
             upcoming_news = await calendar_client.get_upcoming_high_impact(minutes_ahead=self.config.news_pause_minutes)
 
+            # FIX: open_symbols set — her pozisyon açıldığında güncellenir, duplicate önlenir
+            open_symbols: set[str] = set()
+            async with AsyncSessionLocal() as pos_db:
+                existing = await self._get_open_positions(pos_db)
+                open_symbols = {t.symbol.upper() for t in existing}
+
+            logger.info(f"Scan start | open_symbols={open_symbols}")
+
             for strategy in strategies:
                 for market_type in (strategy.markets or []):
                     for symbol in self._get_symbols(strategy, market_type):
+                        # FIX: her iterasyonda güncel open_symbols ile kontrol et
+                        if symbol.upper() in open_symbols:
+                            logger.info(f"Duplicate skip | {symbol} already open")
+                            continue
                         try:
-                            # Her sembol için ayrı DB session — transaction hatalarını önler
                             async with AsyncSessionLocal() as sym_db:
-                                await self._analyze_and_trade(sym_db, symbol, market_type, strategy, open_positions, account_info, upcoming_news, risk_manager)
+                                opened = await self._analyze_and_trade(
+                                    sym_db, symbol, market_type, strategy,
+                                    open_symbols, account_info, upcoming_news, risk_manager
+                                )
+                                # FIX: eğer pozisyon açıldıysa open_symbols'e ekle
+                                if opened:
+                                    open_symbols.add(symbol.upper())
                             await asyncio.sleep(1)
                         except Exception as e:
                             logger.error(f"Error on {symbol}: {e}")
 
-    def _detect_market_type(self, symbol: str, strategy_market_type: str) -> str:
-        """Detect correct market type from symbol name."""
-        crypto_keywords = ['BTC', 'ETH', 'SOL', 'XRP', 'LTC', 'ADA', 'DOGE', 'AVAX', 'PEPE', 'SHIB', 'TRX', 'AAVE', 'HBAR', 'XLM', 'USDT', 'ALGO', 'ALPHA']
-        commodity_keywords = ['GOLD', 'SILVER', 'OIL', 'BRENT', 'NATURALGAS', 'COCOA', 'CORN', 'WHEAT', 'SUGAR', 'COFFEE', 'COPPER', 'PALLADIUM', 'PLATINUM', 'SB']
-        index_keywords = ['US500', 'US30', 'US100', 'DE40', 'UK100', 'JP225', 'AU200', 'HK50', 'FR40', 'NAS']
-        forex_keywords = ['USD', 'EUR', 'GBP', 'JPY', 'CHF', 'CAD', 'AUD', 'NZD']
+    # ── Market Type Detection ──
 
-        sym = symbol.upper()
-        for k in crypto_keywords:
+    def _detect_market_type(self, symbol: str, fallback: str) -> str:
+        sym = symbol.upper().replace("/", "").replace("-", "")
+        crypto = ['BTC','ETH','SOL','XRP','LTC','ADA','DOGE','AVAX','PEPE','SHIB','TRX','AAVE','HBAR','XLM','USDT','ALGO']
+        commodity = ['GOLD','SILVER','OIL','BRENT','NATGAS','CORN','WHEAT','SUGAR','COFFEE','COPPER','COCOA','PLATINUM','PALLADIUM','XAU','XAG']
+        index = ['US500','US30','US100','NAS','DE40','UK100','JP225','AU200','FR40','HK50','SPX','DOW']
+        forex_ccy = ['USD','EUR','GBP','JPY','CHF','CAD','AUD','NZD']
+
+        for k in crypto:
             if k in sym:
                 return 'crypto'
-        for k in commodity_keywords:
+        for k in commodity:
             if k in sym:
                 return 'commodity'
-        for k in index_keywords:
+        for k in index:
             if k in sym:
                 return 'index'
-        if any(sym.startswith(k) or sym.endswith(k) for k in forex_keywords):
+        if any(sym.startswith(k) or sym.endswith(k) for k in forex_ccy) and len(sym) <= 7:
             return 'forex'
-        # Check if it looks like a stock (no currency pairs, no known keywords)
-        if len(sym) <= 6 and sym.isalpha():
+        if sym.isalpha() and len(sym) <= 5:
             return 'stock'
-        return strategy_market_type
+        return fallback
 
-    async def _analyze_and_trade(self, db, symbol, market_type, strategy, open_positions, account_info, upcoming_news, risk_manager):
-        # Auto-detect correct market type
+    # FIX: returns True if trade was opened, False otherwise
+    async def _analyze_and_trade(self, db, symbol, market_type, strategy, open_symbols: set, account_info, upcoming_news, risk_manager) -> bool:
         market_type = self._detect_market_type(symbol, market_type)
-        adapter = self.adapters.get(market_type)
+
+        # FIX: adapter — market_type'a göre ara, yoksa ilk mevcut adapter'ı kullan
+        adapter = self.adapters.get(market_type) or next(iter(self.adapters.values()), None)
         if not adapter:
-            # Fallback to any available adapter
-            if self.adapters:
-                adapter = list(self.adapters.values())[0]
-            else:
-                return
+            logger.warning(f"No adapter available for {symbol}")
+            return False
 
         try:
             tick = await adapter.get_tick(symbol)
@@ -157,7 +171,7 @@ class TradingBot:
             df_4h = await adapter.get_candles(symbol, "4h", 100)
         except Exception as e:
             logger.warning(f"Data fetch failed {symbol}: {e}")
-            return
+            return False
 
         indicators = calculate_indicators(df_1h)
         patterns = detect_patterns(df_1h)
@@ -174,7 +188,6 @@ class TradingBot:
         strategy_type = strategy.strategy_type.value if hasattr(strategy.strategy_type, "value") else str(strategy.strategy_type)
         indicators = apply_strategy_filters(indicators, strategy_type, strategy.parameters or {})
 
-        # Convert numpy types to Python native for JSON serialization
         import numpy as np
         indicators = {
             k: (bool(v) if isinstance(v, np.bool_) else
@@ -187,12 +200,13 @@ class TradingBot:
 
         daily_pnl = -(self.config.daily_loss or 0.0)
 
+        # FIX: open_positions sayısı için open_symbols kullan
         signal = await analyze_market(
             symbol=symbol, market_type=market_type,
             strategy_name=strategy.name, strategy_params=strategy.parameters or {},
             indicators=indicators, recent_news=news_items, economic_events=upcoming_news,
             current_price=tick.price, bid=tick.bid, ask=tick.ask, spread=tick.spread,
-            open_positions=len(open_positions), max_positions=self.config.max_positions,
+            open_positions=len(open_symbols), max_positions=self.config.max_positions,
             account_balance=account_info["balance"], daily_pnl=daily_pnl,
             max_daily_loss_pct=self.config.max_daily_loss_pct,
             max_risk_pct=self.config.max_risk_per_trade_pct,
@@ -202,7 +216,7 @@ class TradingBot:
         await self._log_signal(db, symbol, market_type, signal)
 
         if signal["signal"] == "hold" or signal.get("confidence", 0) < 0.65:
-            return
+            return False
 
         entry_price = tick.ask if signal["signal"] == "buy" else tick.bid
         atr = indicators.get("atr_14", entry_price * 0.01)
@@ -225,24 +239,26 @@ class TradingBot:
             market_type=market_type,
         )
 
+        # FIX: open_positions listesi olarak open_symbols'den dummy list ver
         risk_result = await risk_manager.check_new_trade(
             user_id=self.user_id, market_type=market_type, symbol=symbol,
             lot_size=lot_size, entry_price=entry_price,
             stop_loss=stop_loss,
             account_balance=account_info["balance"],
-            open_positions=open_positions, upcoming_news=upcoming_news,
+            open_positions=list(open_symbols), upcoming_news=upcoming_news,
         )
 
         if not risk_result.allowed:
             logger.info(f"Trade blocked {symbol}: {risk_result.reason}")
-            return
+            return False
 
         if risk_result.adjusted_lot_size:
             lot_size = risk_result.adjusted_lot_size
 
         broker_account = await self._get_broker_for_market(db, market_type)
         if not broker_account:
-            return
+            logger.warning(f"No broker account found for {symbol}")
+            return False
 
         if self.config.trade_mode == TradeMode.LIVE:
             order_id = await adapter.place_order(
@@ -259,6 +275,10 @@ class TradingBot:
             trade = await self._save_trade(db, broker_account.id, strategy.id, symbol, market_type, signal, entry_price, lot_size, order_id)
             await self.notifier.send_trade_opened(trade, signal)
             await publish(f"trades:{self.user_id}", {"event": "trade_opened", "symbol": symbol, "side": signal["signal"], "price": entry_price})
+            logger.info(f"Trade opened | {symbol} {signal['signal']} | order_id={order_id}")
+            return True
+
+        return False
 
     # ── Position Sync ──
 
@@ -266,7 +286,8 @@ class TradingBot:
         async with AsyncSessionLocal() as db:
             open_trades = await self._get_open_positions(db)
             for trade in open_trades:
-                adapter = self.adapters.get(trade.market_type.value)
+                # FIX: adapter bulunamazsa fallback kullan
+                adapter = self.adapters.get(trade.market_type.value) or next(iter(self.adapters.values()), None)
                 if not adapter:
                     continue
                 try:
@@ -294,7 +315,7 @@ class TradingBot:
         return r.scalars().all()
 
     async def _get_broker_for_market(self, db: AsyncSession, market_type: str):
-        # Return any connected broker (Capital.com handles all market types)
+        # Capital.com tüm market tiplerini destekler — market_type filtresi yok
         r = await db.execute(select(BrokerAccount).where(
             BrokerAccount.user_id == self.user_id,
             BrokerAccount.is_active == True,
@@ -375,8 +396,13 @@ class TradingBot:
             try:
                 adapter = get_broker_adapter(account)
                 if await adapter.connect():
-                    self.adapters[account.market_type.value] = adapter
-                    logger.info(f"Connected: {account.broker_type} ({account.market_type.value})")
+                    # FIX: Capital.com tüm market tiplerini destekler
+                    # Adapter'ı hem kendi market_type'ı hem de diğer tüm tipler için kaydet
+                    for mt in ["forex", "crypto", "commodity", "index", "stock"]:
+                        if mt not in self.adapters:
+                            self.adapters[mt] = adapter
+                    self.adapters[account.market_type.value] = adapter  # override kendi tipi
+                    logger.info(f"Connected: {account.broker_type} ({account.market_type.value}) — registered for all market types")
             except Exception as e:
                 logger.error(f"Broker error {account.broker_type}: {e}")
 
@@ -390,7 +416,11 @@ class TradingBot:
 
     async def _get_consolidated_account(self) -> dict:
         balance, equity = 0.0, 0.0
+        seen = set()
         for adapter in self.adapters.values():
+            if id(adapter) in seen:
+                continue
+            seen.add(id(adapter))
             try:
                 info = await adapter.get_account_info()
                 balance += info.balance
