@@ -115,10 +115,40 @@ class TradingBot:
                         except Exception as e:
                             logger.error(f"Error on {symbol}: {e}")
 
+    def _detect_market_type(self, symbol: str, strategy_market_type: str) -> str:
+        """Detect correct market type from symbol name."""
+        crypto_keywords = ['BTC', 'ETH', 'SOL', 'XRP', 'LTC', 'ADA', 'DOGE', 'AVAX', 'PEPE', 'SHIB', 'TRX', 'AAVE', 'HBAR', 'XLM', 'USDT', 'ALGO', 'ALPHA']
+        commodity_keywords = ['GOLD', 'SILVER', 'OIL', 'BRENT', 'NATURALGAS', 'COCOA', 'CORN', 'WHEAT', 'SUGAR', 'COFFEE', 'COPPER', 'PALLADIUM', 'PLATINUM', 'SB']
+        index_keywords = ['US500', 'US30', 'US100', 'DE40', 'UK100', 'JP225', 'AU200', 'HK50', 'FR40', 'NAS']
+        forex_keywords = ['USD', 'EUR', 'GBP', 'JPY', 'CHF', 'CAD', 'AUD', 'NZD']
+
+        sym = symbol.upper()
+        for k in crypto_keywords:
+            if k in sym:
+                return 'crypto'
+        for k in commodity_keywords:
+            if k in sym:
+                return 'commodity'
+        for k in index_keywords:
+            if k in sym:
+                return 'index'
+        if any(sym.startswith(k) or sym.endswith(k) for k in forex_keywords):
+            return 'forex'
+        # Check if it looks like a stock (no currency pairs, no known keywords)
+        if len(sym) <= 6 and sym.isalpha():
+            return 'stock'
+        return strategy_market_type
+
     async def _analyze_and_trade(self, db, symbol, market_type, strategy, open_positions, account_info, upcoming_news, risk_manager):
+        # Auto-detect correct market type
+        market_type = self._detect_market_type(symbol, market_type)
         adapter = self.adapters.get(market_type)
         if not adapter:
-            return
+            # Fallback to any available adapter
+            if self.adapters:
+                adapter = list(self.adapters.values())[0]
+            else:
+                return
 
         try:
             tick = await adapter.get_tick(symbol)
