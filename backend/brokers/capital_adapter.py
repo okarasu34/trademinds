@@ -328,8 +328,13 @@ class CapitalAdapter(BrokerAdapter):
                         0
                     )
 
+                    # DB'de dealReference olarak kayıtlı — sync için dealReference kullan
+                    deal_ref = position_data.get("dealReference", "")
+                    deal_id  = position_data.get("dealId", "")
+                    order_id = deal_ref if deal_ref else deal_id
+
                     orders.append(OpenOrder(
-                        order_id      = position_data.get("dealId", ""),
+                        order_id      = order_id,
                         symbol        = market.get("epic", ""),
                         side          = "buy" if position_data.get("direction") == "BUY" else "sell",
                         lot_size      = position_data.get("size", 0),
