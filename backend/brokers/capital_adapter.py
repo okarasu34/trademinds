@@ -216,7 +216,6 @@ class CapitalAdapter(BrokerAdapter):
                 df["timestamp"] = pd.to_datetime(df["timestamp"])
                 df.set_index("timestamp", inplace=True)
 
-                # Extract bid price from dict fields (Capital.com returns {"bid": x, "ask": y})
                 for col in ["open", "high", "low", "close"]:
                     if col in df.columns and len(df) > 0 and isinstance(df[col].iloc[0], dict):
                         df[col] = df[col].apply(
@@ -316,20 +315,30 @@ class CapitalAdapter(BrokerAdapter):
                 orders    = []
 
                 for pos in positions:
-                    market         = pos.get("market", {})
-                    position_data  = pos.get("position", {})
+                    market        = pos.get("market", {})
+                    position_data = pos.get("position", {})
+
+                    # FIX: Capital.com'da PnL alanı "upl" (unrealized profit/loss)
+                    # "profit" alanı yoksa "upl" dene, o da yoksa 0
+                    pnl = (
+                        position_data.get("upl") or
+                        position_data.get("profit") or
+                        position_data.get("unrealisedProfit") or
+                        position_data.get("unrealizedProfit") or
+                        0
+                    )
 
                     orders.append(OpenOrder(
-                        order_id     = position_data.get("dealId", ""),
-                        symbol       = market.get("epic", ""),
-                        side         = "buy" if position_data.get("direction") == "BUY" else "sell",
-                        lot_size     = position_data.get("size", 0),
-                        entry_price  = position_data.get("level", 0),
-                        current_price= market.get("bid", 0),
-                        stop_loss    = position_data.get("stopLevel"),
-                        take_profit  = position_data.get("profitLevel"),
-                        pnl          = position_data.get("profit", 0),
-                        opened_at    = position_data.get("createdDate", ""),
+                        order_id      = position_data.get("dealId", ""),
+                        symbol        = market.get("epic", ""),
+                        side          = "buy" if position_data.get("direction") == "BUY" else "sell",
+                        lot_size      = position_data.get("size", 0),
+                        entry_price   = position_data.get("level", 0),
+                        current_price = market.get("bid", 0),
+                        stop_loss     = position_data.get("stopLevel"),
+                        take_profit   = position_data.get("profitLevel"),
+                        pnl           = float(pnl),
+                        opened_at     = position_data.get("createdDate", ""),
                     ))
 
                 return orders
