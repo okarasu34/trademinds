@@ -1,68 +1,96 @@
+"""
+Scheduler — bot job'larını zamanlar.
+
+İki job:
+  1. bot_scan: Her 5 dakikada bir bot.scan() çağırır (sinyal + emir pipeline'ı)
+  2. balance_sync: Her 5 dakikada bir aktif broker'ların balance'ını DB'ye senkronlar
+"""
+from datetime import datetime
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
-from apscheduler.triggers.cron import CronTrigger
 from loguru import logger
-from bot.trading_bot import TradingBot
+from sqlalchemy import select
 
-# Bot motorunu burada başlatıyoruz
+from db.database import AsyncSessionLocal
+from db.models import BrokerAccount
+from brokers.capital_adapter import CapitalAdapter
+from bot.trading_bot import bot_instance
+
+
 scheduler = AsyncIOScheduler(timezone="UTC")
-bot_instance = TradingBot()
+
+
+async def bot_scan_job():
+    """Her 5 dakikada bir: sinyal üret + emir pipeline'ı."""
+    try:
+        await bot_instance.scan()
+    except Exception as e:
+        logger.exception(f"bot_scan_job failed: {e}")
+
+
+async def balance_sync_job():
+    """Her 5 dakikada bir: tüm aktif broker'ların canlı balance'ını DB'ye yaz."""
+    async with AsyncSessionLocal() as db:
+        try:
+            result = await db.execute(
+                select(BrokerAccount).where(BrokerAccount.is_active == True)
+            )
+            brokers = result.scalars().all()
+
+            for broker in brokers:
+                if broker.broker_type != "capitalcom":
+                    continue  # şimdilik sadece Capital.com
+
+                try:
+                    adapter = CapitalAdapter(broker)
+                    if not await adapter.connect():
+                        logger.warning(f"[balance_sync] {broker.name}: connect failed")
+                        continue
+
+                    info = await adapter.get_account_info()
+                    broker.balance = info.balance
+                    broker.equity = info.equity
+                    broker.margin_used = info.margin_used
+                    broker.currency = info.currency
+                    broker.last_sync = datetime.utcnow()
+                    broker.is_connected = True
+
+                    await db.commit()
+                    logger.info(
+                        f"[balance_sync] {broker.name}: {info.balance:.2f} {info.currency}"
+                    )
+
+                    await adapter.disconnect()
+
+                except Exception as e:
+                    logger.exception(f"[balance_sync] {broker.name} error: {e}")
+                    await db.rollback()
+
+        except Exception as e:
+            logger.exception(f"balance_sync_job failed: {e}")
+
 
 def setup_scheduler():
-    """Tüm görevleri kaydet ve botu ateşle."""
-
-    # ─── ANA ANALİZ VE İŞLEM MOTORU (Her 60 Saniyede Bir) ───
-    # Bu satır botun piyasayı taramasını sağlar
+    """Job'ları kaydet, scheduler'ı başlat."""
+    # Bot scan: her 5 dakikada bir
     scheduler.add_job(
-        bot_instance._scan_and_execute,
-        IntervalTrigger(seconds=60),
-        id="main_trading_engine",
-        replace_existing=True,
-    )
-
-    # ─── Bot Sağlık Kontrolü ───
-    from bot.scheduler import health_check_all_bots
-    scheduler.add_job(
-        health_check_all_bots,
-        IntervalTrigger(seconds=60),
-        id="health_check",
-        replace_existing=True,
-    )
-
-    # ─── Ekonomik Takvim Yenileme ───
-    from bot.scheduler import refresh_calendar
-    scheduler.add_job(
-        refresh_calendar,
+        bot_scan_job,
         IntervalTrigger(minutes=5),
-        id="calendar_refresh",
+        id="bot_scan",
         replace_existing=True,
+        max_instances=1,  # paralel çalışma yasak (duplicate koruması)
+        coalesce=True,    # gecikmiş job'lar birleşsin, üst üste binmesin
     )
 
-    # ─── Bakiye Senkronizasyonu ───
-    from bot.scheduler import sync_broker_balances
+    # Balance sync: her 5 dakikada bir (bot scan'den 30 sn sonra başlasın diye sapma yok ama coalesce var)
     scheduler.add_job(
-        sync_broker_balances,
-        IntervalTrigger(minutes=30),
-        id="broker_sync",
+        balance_sync_job,
+        IntervalTrigger(minutes=5),
+        id="balance_sync",
         replace_existing=True,
+        max_instances=1,
+        coalesce=True,
     )
 
     scheduler.start()
-    logger.info(">>> TRADING ENGINE VE SCHEDULER BAŞLATILDI <<<")
-
-# Mevcut fonksiyonlarını aşağıya ekliyoruz (Dosya bütünlüğü için)
-async def health_check_all_bots():
-    from bot.scheduler_tasks import health_check_all_bots as hc
-    await hc()
-
-async def refresh_calendar():
-    from data.calendar import calendar_client
-    try:
-        await calendar_client.get_calendar(hours_ahead=24, impact_filter=["high", "medium"])
-    except Exception as e:
-        logger.warning(f"Calendar refresh failed: {e}")
-
-async def sync_broker_balances():
-    # Mevcut fonksiyonun içeriği buraya gelecek veya import edilecek
-    pass
-EOF
+    logger.info(">>> Scheduler started: bot_scan + balance_sync (every 5 min)")
