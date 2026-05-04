@@ -271,14 +271,14 @@ class StrategyEngine:
         confidence = 0.0
         reasoning = ""
 
-        if last_rsi < 30 and last_close > last_sma:
+        if last_rsi < 50:
             side = OrderSide.BUY
-            confidence = min(0.5 + (30 - last_rsi) / 60, 0.95)
-            reasoning = f"RSI oversold ({last_rsi:.1f}) + price above SMA20"
-        elif last_rsi > 70 and last_close < last_sma:
+            confidence = min(0.5 + (50 - last_rsi) / 100, 0.95)
+            reasoning = f"TEST: RSI={last_rsi:.1f} < 50 → BUY"
+        elif last_rsi > 50:
             side = OrderSide.SELL
-            confidence = min(0.5 + (last_rsi - 70) / 60, 0.95)
-            reasoning = f"RSI overbought ({last_rsi:.1f}) + price below SMA20"
+            confidence = min(0.5 + (last_rsi - 50) / 100, 0.95)
+            reasoning = f"TEST: RSI={last_rsi:.1f} > 50 → SELL"
 
         if side is None:
             return None
