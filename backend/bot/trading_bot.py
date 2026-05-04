@@ -24,7 +24,7 @@ from db.models import (
 )
 from db.redis_client import cache_set, cache_get, get_redis
 from brokers.capital_adapter import CapitalAdapter
-from bot.indicators import calculate_rsi, calculate_sma
+from bot.indicators import calculate_indicators
 
 
 # ─────────────────────── DATA CLASSES ───────────────────────
@@ -70,7 +70,7 @@ class SignalValidator:
 
 class PositionGuard:
     """2. Kapı: Açık pozisyon kontrolü.
-    Capital.com'dan canlı pozisyonları çeker, aynı symbol+side varsa reddeder.
+    Capital.com'dan canlı pozisyonları çeker, aynı symbol varsa reddeder.
     Ayrıca max_positions ve market_limits limitlerini kontrol eder."""
 
     @staticmethod
@@ -162,9 +162,7 @@ class RiskManager:
             stop_loss = round(price * (1 + sl_distance_pct), 5)
             take_profit = round(price * (1 - sl_distance_pct * 2), 5)
 
-        # Lot size = risk_amount / (price * sl_distance_pct)
-        # Bu hesap çok basit — Capital.com'un min/max lot kurallarına uymayabilir
-        # Şu an minimum güvenli değeri kullanıyoruz: 0.1
+        # Lot size hesabı (basit yaklaşım, Capital.com min/max kuralları için clamp)
         sl_distance = abs(price - stop_loss)
         if sl_distance <= 0:
             return False, "Invalid SL distance", None
@@ -254,18 +252,20 @@ class StrategyEngine:
             return None
 
         try:
-            rsi = calculate_rsi(df["close"], period=14)
-            sma = calculate_sma(df["close"], period=20)
+            ind = calculate_indicators(df)
         except Exception as e:
             logger.warning(f"[{symbol}] Indicator error: {e}")
             return None
 
-        if rsi.empty or sma.empty:
+        if not ind or "rsi_14" not in ind or "sma_20" not in ind:
             return None
 
-        last_rsi = float(rsi.iloc[-1])
-        last_sma = float(sma.iloc[-1])
+        last_rsi = ind["rsi_14"]
+        last_sma = ind["sma_20"]
         last_close = float(df["close"].iloc[-1])
+
+        if last_rsi is None or last_sma is None:
+            return None
 
         side = None
         confidence = 0.0
@@ -287,7 +287,7 @@ class StrategyEngine:
             user_id=user_id,
             broker_id=broker_id,
             symbol=symbol,
-            market_type=MarketType.FOREX,  # default; PositionGuard'ın infer'ı sınırı kontrol eder
+            market_type=MarketType.FOREX,
             side=side,
             confidence=confidence,
             reasoning=reasoning,
