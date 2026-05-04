@@ -65,11 +65,12 @@ class CapitalAdapter(BrokerAdapter):
                     return False
 
                 data = await resp.json()
-                self.account_id = data.get("accountId")
+                self.account_id = data.get("accountId") or data.get("currentAccountId")
                 logger.info(f"Connected to Capital.com | account={self.account_id}")
 
-                asyncio.create_task(self.load_trademinds_watchlist())
-                return True
+            # Watchlist'i await ile yükle (race condition fix)
+            await self.load_trademinds_watchlist()
+            return True
 
         except Exception as e:
             logger.error(f"Capital.com connect error: {e}")
@@ -213,17 +214,11 @@ class CapitalAdapter(BrokerAdapter):
                     "lastTradedVolume":  "volume",
                 })
 
-                df["timestamp"] = pd.to_datetime(df["timestamp"])
-                df.set_index("timestamp", inplace=True)
-
+                # Capital.com bid/ask dict döndürüyor — close olarak bid kullan
                 for col in ["open", "high", "low", "close"]:
-                    if col in df.columns and len(df) > 0 and isinstance(df[col].iloc[0], dict):
-                        df[col] = df[col].apply(
-                            lambda x: float(x.get("bid", 0)) if isinstance(x, dict) else float(x)
-                        )
+                    if col in df.columns and df[col].apply(lambda x: isinstance(x, dict)).any():
+                        df[col] = df[col].apply(lambda x: x.get("bid") if isinstance(x, dict) else x)
 
-                if "volume" not in df.columns:
-                    df["volume"] = 1
                 df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(1)
 
                 df = df[["open", "high", "low", "close", "volume"]]
@@ -318,8 +313,6 @@ class CapitalAdapter(BrokerAdapter):
                     market        = pos.get("market", {})
                     position_data = pos.get("position", {})
 
-                    # FIX: Capital.com'da PnL alanı "upl" (unrealized profit/loss)
-                    # "profit" alanı yoksa "upl" dene, o da yoksa 0
                     pnl = (
                         position_data.get("upl") or
                         position_data.get("profit") or
@@ -328,7 +321,6 @@ class CapitalAdapter(BrokerAdapter):
                         0
                     )
 
-                    # DB'de dealReference olarak kayıtlı — sync için dealReference kullan
                     deal_ref = position_data.get("dealReference", "")
                     deal_id  = position_data.get("dealId", "")
                     order_id = deal_ref if deal_ref else deal_id
