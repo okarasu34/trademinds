@@ -4,11 +4,9 @@ TradeMinds bot core — pipeline architecture.
 Her sinyal şu kapılardan geçmek zorunda:
   Strategy Engine → Signal Validator → Position Guard → Risk Manager → Order Executor
 
-Bu sıralama duplicate emirleri ve aynı sembolde çoklu pozisyon açmayı
-mimari olarak imkansız hale getirir. Bir kapı geçilmezse pipeline durur.
-
-Fix: Position Guard artık scan başında çekilen local cache'e bakıyor.
-Her emir açıldıkça cache güncelleniyor — Capital.com gecikme sorunu çözüldü.
+Fix: RiskManager artık Capital.com'dan sembol kurallarını çekiyor.
+     Minimum lot size ve stop distance sembol bazında doğru hesaplanıyor.
+Fix: Position Guard local cache kullanıyor — race condition yok.
 """
 import asyncio
 import hashlib
@@ -53,8 +51,7 @@ class Signal:
 @dataclass
 class ScanContext:
     """Tek bir scan boyunca paylaşılan context.
-    open_symbols: scan başında Capital.com'dan çekilen + scan boyunca açılan semboller.
-    Her emir açıldıkça buraya eklenir — Capital.com gecikme race condition'ını önler."""
+    open_symbols: scan başında Capital.com'dan çekilen + scan boyunca açılan semboller."""
     open_symbols: set = field(default_factory=set)
     open_count: int = 0
     market_counts: dict = field(default_factory=dict)
@@ -77,8 +74,7 @@ class SignalValidator:
 
 class PositionGuard:
     """2. Kapı: Local cache tabanlı pozisyon kontrolü.
-    Capital.com'a her seferinde sormak yerine scan-başı snapshot + local update kullanır.
-    Bu sayede Capital.com gecikme race condition'ı ortadan kalkar."""
+    Capital.com gecikme race condition'ını önler."""
 
     @staticmethod
     def check(
@@ -86,18 +82,15 @@ class PositionGuard:
         ctx: ScanContext,
         config: BotConfig,
     ) -> tuple[bool, str]:
-        # Aynı symbol'de zaten pozisyon var mı?
         if signal.symbol in ctx.open_symbols:
             return False, f"Position already open: {signal.symbol}"
 
-        # Global max_positions limit
         if ctx.open_count >= config.max_positions:
             return False, f"Max positions reached ({ctx.open_count}/{config.max_positions})"
 
-        # Market type limiti
         market_limits = config.market_limits or {}
-        market_key = signal.market_type.value
-        market_limit = market_limits.get(market_key)
+        market_key    = signal.market_type.value
+        market_limit  = market_limits.get(market_key)
         if market_limit:
             current = ctx.market_counts.get(market_key, 0)
             if current >= market_limit:
@@ -116,7 +109,7 @@ class PositionGuard:
     @staticmethod
     def _infer_market(symbol: str) -> str:
         s = symbol.upper()
-        if any(c in s for c in ("BTC", "ETH", "XRP", "DOGE", "SOL", "ADA", "AAVE", "AVAX", "LTC")):
+        if any(c in s for c in ("BTC", "ETH", "XRP", "DOGE", "SOL", "ADA", "AAVE", "AVAX", "LTC", "SHIB", "PEPE", "TRX", "HBAR", "XLM", "ALPHA", "USDT")):
             return "crypto"
         if any(c in s for c in ("XAU", "XAG", "OIL", "GAS", "GOLD", "SILVER", "PLATINUM", "PALLADIUM")):
             return "commodity"
@@ -128,7 +121,8 @@ class PositionGuard:
 
 
 class RiskManager:
-    """3. Kapı: Lot size hesabı + SL/TP belirleme."""
+    """3. Kapı: Capital.com'dan sembol kurallarını çekip lot size ve SL/TP hesaplar.
+    Minimum lot size sembol bazında — artık invalid.size.minvalue hatası yok."""
 
     @staticmethod
     async def calculate(
@@ -137,15 +131,24 @@ class RiskManager:
         config: BotConfig,
     ) -> tuple[bool, str, Optional[dict]]:
         try:
-            tick = await adapter.get_tick(signal.symbol)
+            rules = await adapter.get_market_rules(signal.symbol)
         except Exception as e:
-            return False, f"Tick fetch failed: {e}", None
+            return False, f"Market rules fetch failed: {e}", None
 
-        price = tick.ask if signal.side == OrderSide.BUY else tick.bid
-        if not price or price <= 0:
+        min_size     = rules.get("min_size", 1.0)
+        min_stop_pct = rules.get("min_stop_pct", 0.1)
+        bid          = rules.get("bid", 0)
+        ask          = rules.get("ask", 0)
+
+        if not bid or not ask:
             return False, f"Invalid price for {signal.symbol}", None
 
-        sl_distance_pct = 0.01
+        price = ask if signal.side == OrderSide.BUY else bid
+
+        # Stop distance: Capital.com minimum stop distance'ına uy
+        # minStopOrProfitDistance PERCENTAGE ise: price * pct / 100
+        sl_distance_pct = max(min_stop_pct / 100.0 * 1.5, 0.001)  # min'in 1.5 katı, güvenli marj
+
         if signal.side == OrderSide.BUY:
             stop_loss   = round(price * (1 - sl_distance_pct), 5)
             take_profit = round(price * (1 + sl_distance_pct * 2), 5)
@@ -153,16 +156,18 @@ class RiskManager:
             stop_loss   = round(price * (1 + sl_distance_pct), 5)
             take_profit = round(price * (1 - sl_distance_pct * 2), 5)
 
-        sl_distance = abs(price - stop_loss)
-        if sl_distance <= 0:
-            return False, "Invalid SL distance", None
+        # Lot size: minimum'u kullan (demo test için yeterli)
+        lot_size = float(min_size)
 
-        lot_size = 0.1  # sabit, basit test için
+        logger.info(
+            f"[{signal.symbol}] Rules: min_size={min_size} min_stop_pct={min_stop_pct}% "
+            f"→ lot={lot_size} sl={stop_loss} tp={take_profit}"
+        )
 
         return True, "OK", {
-            "lot_size": lot_size,
+            "lot_size":    lot_size,
             "entry_price": price,
-            "stop_loss": stop_loss,
+            "stop_loss":   stop_loss,
             "take_profit": take_profit,
         }
 
@@ -179,35 +184,35 @@ class OrderExecutor:
         db: AsyncSession,
     ) -> tuple[bool, str, Optional[Trade]]:
         deal_ref = await adapter.place_order(
-            symbol=signal.symbol,
-            side=signal.side.value,
-            lot_size=risk_params["lot_size"],
-            stop_loss=risk_params["stop_loss"],
-            take_profit=risk_params["take_profit"],
-            comment=f"TradeMinds:{signal.idempotency_key()}",
+            symbol      = signal.symbol,
+            side        = signal.side.value,
+            lot_size    = risk_params["lot_size"],
+            stop_loss   = risk_params["stop_loss"],
+            take_profit = risk_params["take_profit"],
+            comment     = f"TradeMinds:{signal.idempotency_key()}",
         )
 
         if not deal_ref:
             return False, "Capital.com returned no dealReference", None
 
         trade = Trade(
-            user_id=signal.user_id,
-            broker_id=signal.broker_id,
-            strategy_id=None,
-            symbol=signal.symbol,
-            market_type=signal.market_type,
-            side=signal.side,
-            status=OrderStatus.OPEN,
-            trade_mode=TradeMode(config.trade_mode.value),
-            entry_price=risk_params["entry_price"],
-            lot_size=risk_params["lot_size"],
-            stop_loss=risk_params["stop_loss"],
-            take_profit=risk_params["take_profit"],
-            ai_reasoning=signal.reasoning,
-            ai_confidence=signal.confidence,
-            signals_used=signal.indicators,
-            broker_order_id=deal_ref,
-            opened_at=datetime.utcnow(),
+            user_id        = signal.user_id,
+            broker_id      = signal.broker_id,
+            strategy_id    = None,
+            symbol         = signal.symbol,
+            market_type    = signal.market_type,
+            side           = signal.side,
+            status         = OrderStatus.OPEN,
+            trade_mode     = TradeMode(config.trade_mode.value),
+            entry_price    = risk_params["entry_price"],
+            lot_size       = risk_params["lot_size"],
+            stop_loss      = risk_params["stop_loss"],
+            take_profit    = risk_params["take_profit"],
+            ai_reasoning   = signal.reasoning,
+            ai_confidence  = signal.confidence,
+            signals_used   = signal.indicators,
+            broker_order_id = deal_ref,
+            opened_at      = datetime.utcnow(),
         )
         db.add(trade)
         await db.commit()
@@ -257,7 +262,7 @@ class StrategyEngine:
         confidence = 0.0
         reasoning  = ""
 
-        # TEST: gevşek eşikler — bol sinyal için
+        # TEST: gevşek eşikler
         if last_rsi < 50:
             side       = OrderSide.BUY
             confidence = min(0.5 + (50 - last_rsi) / 100, 0.95)
@@ -270,32 +275,30 @@ class StrategyEngine:
         if side is None:
             return None
 
-        # Market type'ı infer et
-        market_type = MarketType.FOREX
-        inferred = PositionGuard._infer_market(symbol)
-        market_map = {
-            "crypto": MarketType.CRYPTO,
+        inferred    = PositionGuard._infer_market(symbol)
+        market_map  = {
+            "crypto":    MarketType.CRYPTO,
             "commodity": MarketType.COMMODITY,
-            "index": MarketType.INDEX,
-            "stock": MarketType.STOCK,
-            "forex": MarketType.FOREX,
+            "index":     MarketType.INDEX,
+            "stock":     MarketType.STOCK,
+            "forex":     MarketType.FOREX,
         }
         market_type = market_map.get(inferred, MarketType.FOREX)
 
         return Signal(
-            user_id=user_id,
-            broker_id=broker_id,
-            symbol=symbol,
-            market_type=market_type,
-            side=side,
-            confidence=confidence,
-            reasoning=reasoning,
-            indicators={
-                "rsi": round(last_rsi, 2),
+            user_id    = user_id,
+            broker_id  = broker_id,
+            symbol     = symbol,
+            market_type = market_type,
+            side       = side,
+            confidence = confidence,
+            reasoning  = reasoning,
+            indicators = {
+                "rsi":   round(last_rsi, 2),
                 "sma20": round(last_sma, 5),
                 "close": round(last_close, 5),
             },
-            timestamp=datetime.utcnow(),
+            timestamp  = datetime.utcnow(),
         )
 
 
@@ -366,21 +369,18 @@ class TradingBot:
             logger.warning("Watchlist empty, nothing to scan")
             return
 
-        # ── Scan başında Capital.com'dan pozisyon snapshot'ı al ──
+        # Scan başında Capital.com'dan pozisyon snapshot'ı al
         try:
             live_positions = await adapter.get_open_orders()
         except Exception as e:
             logger.error(f"Failed to fetch live positions: {e}")
             return
 
-        # Local context oluştur — tüm scan boyunca bu kullanılır
         ctx = ScanContext(
             open_symbols  = {p.symbol for p in live_positions},
             open_count    = len(live_positions),
             market_counts = {},
         )
-
-        # market_counts'u doldur
         for p in live_positions:
             mk = PositionGuard._infer_market(p.symbol)
             ctx.market_counts[mk] = ctx.market_counts.get(mk, 0) + 1
@@ -412,10 +412,10 @@ class TradingBot:
     ):
         # Strategy engine
         signal = await StrategyEngine.generate_signal(
-            user_id=config.user_id,
-            broker_id=broker.id,
-            symbol=symbol,
-            adapter=adapter,
+            user_id   = config.user_id,
+            broker_id = broker.id,
+            symbol    = symbol,
+            adapter   = adapter,
         )
         if not signal:
             return
@@ -424,14 +424,14 @@ class TradingBot:
 
         # AI signal log
         log = AISignalLog(
-            user_id=signal.user_id,
-            symbol=signal.symbol,
-            market_type=signal.market_type,
-            signal=signal.side.value,
-            confidence=signal.confidence,
-            reasoning=signal.reasoning,
-            indicators=signal.indicators,
-            acted_on=False,
+            user_id    = signal.user_id,
+            symbol     = signal.symbol,
+            market_type = signal.market_type,
+            signal     = signal.side.value,
+            confidence = signal.confidence,
+            reasoning  = signal.reasoning,
+            indicators = signal.indicators,
+            acted_on   = False,
         )
         db.add(log)
         await db.commit()
@@ -443,7 +443,7 @@ class TradingBot:
             logger.info(f"[{symbol}] REJECTED at Validator: {msg}")
             return
 
-        # Gate 2: Position Guard (local cache — race condition yok)
+        # Gate 2: Position Guard
         ok, msg = PositionGuard.check(signal, ctx, config)
         if not ok:
             logger.info(f"[{symbol}] REJECTED at PositionGuard: {msg}")
@@ -465,9 +465,7 @@ class TradingBot:
         )
         if ok:
             logger.success(f"[{symbol}] ORDER PLACED: {msg}")
-            # Local cache'i güncelle — bir sonraki sembol bu sembolü görecek
             PositionGuard.register_open(signal, ctx)
-            # Signal log'u güncelle
             log.acted_on = True
             log.trade_id = trade.id
             await db.commit()

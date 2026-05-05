@@ -15,19 +15,17 @@ from db.models import BrokerAccount
 
 
 class CapitalAdapter(BrokerAdapter):
-    """Capital.com CFD broker adapter"""
-
     BASE_URL = "https://demo-api-capital.backend-capital.com/api/v1"
 
     TIMEFRAME_MAP = {
-        "1m": "MINUTE",
-        "5m": "MINUTE_5",
+        "1m":  "MINUTE",
+        "5m":  "MINUTE_5",
         "15m": "MINUTE_15",
         "30m": "MINUTE_30",
-        "1h": "HOUR",
-        "4h": "HOUR_4",
-        "1d": "DAY",
-        "1w": "WEEK",
+        "1h":  "HOUR",
+        "4h":  "HOUR_4",
+        "1d":  "DAY",
+        "1w":  "WEEK",
     }
 
     def __init__(self, account: BrokerAccount):
@@ -68,7 +66,6 @@ class CapitalAdapter(BrokerAdapter):
                 self.account_id = data.get("accountId") or data.get("currentAccountId")
                 logger.info(f"Connected to Capital.com | account={self.account_id}")
 
-            # Watchlist'i await ile yükle (race condition fix)
             await self.load_trademinds_watchlist()
             return True
 
@@ -105,7 +102,7 @@ class CapitalAdapter(BrokerAdapter):
                 if resp.status != 200:
                     raise Exception(f"Account info failed: {resp.status}")
 
-                data = await resp.json()
+                data     = await resp.json()
                 accounts = data.get("accounts", [])
 
                 if not accounts:
@@ -115,11 +112,11 @@ class CapitalAdapter(BrokerAdapter):
                 balance = account.get("balance", {})
 
                 return AccountInfo(
-                    balance=balance.get("balance", 0),
-                    equity=balance.get("balance", 0) + balance.get("profitLoss", 0),
-                    margin_used=balance.get("deposit", 0),
-                    free_margin=balance.get("available", 0),
-                    currency=balance.get("currency", "EUR"),
+                    balance     = balance.get("balance", 0),
+                    equity      = balance.get("balance", 0) + balance.get("profitLoss", 0),
+                    margin_used = balance.get("deposit", 0),
+                    free_margin = balance.get("available", 0),
+                    currency    = balance.get("currency", "EUR"),
                 )
 
         except Exception as e:
@@ -135,49 +132,68 @@ class CapitalAdapter(BrokerAdapter):
                 if resp.status != 200:
                     raise Exception(f"Market data failed: {resp.status}")
 
-                data = await resp.json()
+                data     = await resp.json()
                 snapshot = data.get("snapshot", {})
 
-                bid = float(snapshot.get("bid", 0))
-                ask = float(snapshot.get("offer", 0))
+                bid   = float(snapshot.get("bid", 0))
+                ask   = float(snapshot.get("offer", 0))
                 price = (bid + ask) / 2
 
                 return TickData(
-                    symbol=symbol,
-                    bid=bid,
-                    ask=ask,
-                    price=price,
-                    spread=ask - bid,
-                    timestamp=datetime.utcnow().timestamp(),
+                    symbol    = symbol,
+                    bid       = bid,
+                    ask       = ask,
+                    price     = price,
+                    spread    = ask - bid,
+                    timestamp = datetime.utcnow().timestamp(),
                 )
 
         except Exception as e:
             logger.error(f"Capital.com get_tick error for {symbol}: {e}")
             raise
 
+    async def get_market_rules(self, symbol: str) -> dict:
+        """Sembolün minimum lot size ve stop distance kurallarını döndürür."""
+        try:
+            async with self.session.get(
+                f"{self.BASE_URL}/markets/{symbol}",
+                headers=self._get_headers()
+            ) as resp:
+                if resp.status != 200:
+                    return {"min_size": 1.0, "min_stop_pct": 0.1}
+
+                data          = await resp.json()
+                rules         = data.get("dealingRules", {})
+                snapshot      = data.get("snapshot", {})
+                min_size      = rules.get("minDealSize", {}).get("value", 1.0)
+                min_stop_pct  = rules.get("minStopOrProfitDistance", {}).get("value", 0.1)
+                bid           = float(snapshot.get("bid", 0))
+                ask           = float(snapshot.get("offer", 0))
+
+                return {
+                    "min_size":     float(min_size),
+                    "min_stop_pct": float(min_stop_pct),
+                    "bid":          bid,
+                    "ask":          ask,
+                }
+        except Exception as e:
+            logger.error(f"get_market_rules error for {symbol}: {e}")
+            return {"min_size": 1.0, "min_stop_pct": 0.1, "bid": 0, "ask": 0}
+
     async def get_candles(self, symbol: str, timeframe: str, limit: int = 200) -> pd.DataFrame:
         try:
             resolution = self.TIMEFRAME_MAP.get(timeframe, "HOUR")
 
             now = datetime.utcnow()
-            if timeframe == "1m":
-                start = now - timedelta(minutes=limit)
-            elif timeframe == "5m":
-                start = now - timedelta(minutes=limit * 5)
-            elif timeframe == "15m":
-                start = now - timedelta(minutes=limit * 15)
-            elif timeframe == "30m":
-                start = now - timedelta(minutes=limit * 30)
-            elif timeframe == "1h":
-                start = now - timedelta(hours=limit)
-            elif timeframe == "4h":
-                start = now - timedelta(hours=limit * 4)
-            elif timeframe == "1d":
-                start = now - timedelta(days=limit)
-            elif timeframe == "1w":
-                start = now - timedelta(weeks=limit)
-            else:
-                start = now - timedelta(hours=limit)
+            if   timeframe == "1m":  start = now - timedelta(minutes=limit)
+            elif timeframe == "5m":  start = now - timedelta(minutes=limit * 5)
+            elif timeframe == "15m": start = now - timedelta(minutes=limit * 15)
+            elif timeframe == "30m": start = now - timedelta(minutes=limit * 30)
+            elif timeframe == "1h":  start = now - timedelta(hours=limit)
+            elif timeframe == "4h":  start = now - timedelta(hours=limit * 4)
+            elif timeframe == "1d":  start = now - timedelta(days=limit)
+            elif timeframe == "1w":  start = now - timedelta(weeks=limit)
+            else:                    start = now - timedelta(hours=limit)
 
             from_time = start.strftime("%Y-%m-%dT%H:%M:%S")
             to_time   = now.strftime("%Y-%m-%dT%H:%M:%S")
@@ -186,9 +202,9 @@ class CapitalAdapter(BrokerAdapter):
                 f"{self.BASE_URL}/prices/{symbol}",
                 params={
                     "resolution": resolution,
-                    "from": from_time,
-                    "to": to_time,
-                    "max": limit,
+                    "from":       from_time,
+                    "to":         to_time,
+                    "max":        limit,
                 },
                 headers=self._get_headers()
             ) as resp:
@@ -204,23 +220,20 @@ class CapitalAdapter(BrokerAdapter):
                     return pd.DataFrame()
 
                 df = pd.DataFrame(prices)
-
                 df = df.rename(columns={
-                    "snapshotTime":      "timestamp",
-                    "openPrice":         "open",
-                    "highPrice":         "high",
-                    "lowPrice":          "low",
-                    "closePrice":        "close",
-                    "lastTradedVolume":  "volume",
+                    "snapshotTime":     "timestamp",
+                    "openPrice":        "open",
+                    "highPrice":        "high",
+                    "lowPrice":         "low",
+                    "closePrice":       "close",
+                    "lastTradedVolume": "volume",
                 })
 
-                # Capital.com bid/ask dict döndürüyor — close olarak bid kullan
                 for col in ["open", "high", "low", "close"]:
                     if col in df.columns and df[col].apply(lambda x: isinstance(x, dict)).any():
                         df[col] = df[col].apply(lambda x: x.get("bid") if isinstance(x, dict) else x)
 
                 df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(1)
-
                 df = df[["open", "high", "low", "close", "volume"]]
                 return df
 
@@ -230,23 +243,23 @@ class CapitalAdapter(BrokerAdapter):
 
     async def place_order(
         self,
-        symbol: str,
-        side: str,
-        lot_size: float,
-        stop_loss: float,
+        symbol:      str,
+        side:        str,
+        lot_size:    float,
+        stop_loss:   float,
         take_profit: float,
-        comment: str = "TradeMinds",
+        comment:     str = "TradeMinds",
     ) -> Optional[str]:
         try:
             direction = "BUY" if side == "buy" else "SELL"
 
             order_payload = {
-                "epic":          symbol,
-                "direction":     direction,
-                "size":          lot_size,
+                "epic":           symbol,
+                "direction":      direction,
+                "size":           lot_size,
                 "guaranteedStop": False,
-                "stopLevel":     stop_loss,
-                "profitLevel":   take_profit,
+                "stopLevel":      stop_loss,
+                "profitLevel":    take_profit,
             }
 
             async with self.session.post(
@@ -259,9 +272,9 @@ class CapitalAdapter(BrokerAdapter):
                     logger.error(f"Capital.com place_order failed: {resp.status} - {text}")
                     return None
 
-                data = await resp.json()
+                data          = await resp.json()
                 deal_reference = data.get("dealReference")
-                logger.info(f"Order placed on Capital.com: {symbol} {side} {lot_size} | ref={deal_reference}")
+                logger.info(f"Order placed: {symbol} {side} {lot_size} | ref={deal_reference}")
                 return deal_reference
 
         except Exception as e:
@@ -289,7 +302,7 @@ class CapitalAdapter(BrokerAdapter):
                     logger.error(f"Capital.com close_order failed: {resp.status} - {text}")
                     return False
 
-                logger.info(f"Position closed on Capital.com: {order_id}")
+                logger.info(f"Position closed: {order_id}")
                 return True
 
         except Exception as e:
@@ -397,7 +410,7 @@ class CapitalAdapter(BrokerAdapter):
 
     async def load_trademinds_watchlist(self):
         try:
-            watchlists = await self.get_watchlists()
+            watchlists    = await self.get_watchlists()
             trademinds_wl = None
             for wl in watchlists:
                 if wl.get("name", "").lower() == "trademinds":
@@ -409,20 +422,22 @@ class CapitalAdapter(BrokerAdapter):
                 return
 
             watchlist_id = trademinds_wl.get("id")
-            epics = await self.get_watchlist_markets(watchlist_id)
+            epics        = await self.get_watchlist_markets(watchlist_id)
 
             if epics:
                 self._cached_watchlist_symbols = epics
-                self._watchlist_cache_time = datetime.utcnow()
+                self._watchlist_cache_time     = datetime.utcnow()
                 logger.info(f"Loaded {len(epics)} symbols from TradeMinds watchlist")
 
         except Exception as e:
             logger.error(f"Failed to load TradeMinds watchlist: {e}")
 
     def get_cached_watchlist_symbols(self) -> list[str]:
-        if not self._cached_watchlist_symbols or \
-           not self._watchlist_cache_time or \
-           (datetime.utcnow() - self._watchlist_cache_time).total_seconds() > 3600:
+        if (
+            not self._cached_watchlist_symbols or
+            not self._watchlist_cache_time or
+            (datetime.utcnow() - self._watchlist_cache_time).total_seconds() > 3600
+        ):
             asyncio.create_task(self.load_trademinds_watchlist())
 
         return self._cached_watchlist_symbols
