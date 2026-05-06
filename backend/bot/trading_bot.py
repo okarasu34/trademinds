@@ -1,20 +1,21 @@
 """
 TradeMinds bot core — pipeline architecture.
 
-Fix: RSI yönü düzeltildi — momentum bazlı:
-     RSI > 50 = yukarı momentum = BUY
-     RSI < 50 = aşağı momentum = SELL
-Fix: Position Guard local cache — race condition yok.
-Fix: RiskManager Capital.com min lot size kullanıyor.
+Tüm dashboard ayarları aktif:
+- max_risk_per_trade_pct → lot size hesabında kullanılır
+- max_daily_loss_pct → günlük kayıp limitini kontrol eder
+- max_positions → pozisyon limiti
+- market_limits → market bazında limit
+- pause_on_high_impact_news → haber kontrolü (ileride)
 """
 import asyncio
 import hashlib
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 from dataclasses import dataclass, field
 
 from loguru import logger
-from sqlalchemy import select
+from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.database import AsyncSessionLocal
@@ -57,6 +58,8 @@ class ScanContext:
 # ─────────────────────── PIPELINE GATES ───────────────────────
 
 class SignalValidator:
+    """1. Kapı: Idempotency check."""
+
     @staticmethod
     async def validate(signal: Signal) -> tuple[bool, str]:
         key = f"signal:processed:{signal.idempotency_key()}"
@@ -68,6 +71,8 @@ class SignalValidator:
 
 
 class PositionGuard:
+    """2. Kapı: Local cache tabanlı pozisyon kontrolü."""
+
     @staticmethod
     def check(
         signal: Signal,
@@ -100,18 +105,67 @@ class PositionGuard:
     @staticmethod
     def _infer_market(symbol: str) -> str:
         s = symbol.upper()
-        if any(c in s for c in ("BTC", "ETH", "XRP", "DOGE", "SOL", "ADA", "AAVE", "AVAX", "LTC", "SHIB", "PEPE", "TRX", "HBAR", "XLM", "ALPHA", "USDT")):
+        if any(c in s for c in ("BTC","ETH","XRP","DOGE","SOL","ADA","AAVE","AVAX","LTC","SHIB","PEPE","TRX","HBAR","XLM","ALPHA","USDT")):
             return "crypto"
-        if any(c in s for c in ("XAU", "XAG", "OIL", "GAS", "GOLD", "SILVER", "PLATINUM", "PALLADIUM", "COPPER")):
+        if any(c in s for c in ("XAU","XAG","OIL","GAS","GOLD","SILVER","PLATINUM","PALLADIUM","COPPER","CORN","WHEAT","NATURALGAS","BRENT")):
             return "commodity"
-        if any(c in s for c in ("SPX", "NDX", "DJI", "DAX", "FTSE", "NKY", "US100", "US500", "US30", "DE40")):
+        if any(c in s for c in ("SPX","NDX","DJI","DAX","FTSE","NKY","US100","US500","US30","DE40")):
             return "index"
         if len(s) == 6 and s.isalpha():
             return "forex"
         return "stock"
 
 
+class DailyLossGuard:
+    """3. Kapı: Günlük kayıp limiti kontrolü.
+    Dashboard'daki max_daily_loss_pct ayarını kullanır."""
+
+    @staticmethod
+    async def check(
+        config: BotConfig,
+        db: AsyncSession,
+        broker: BrokerAccount,
+        adapter: CapitalAdapter,
+    ) -> tuple[bool, str]:
+        if not config.max_daily_loss_pct or config.max_daily_loss_pct <= 0:
+            return True, "OK"
+
+        try:
+            info = await adapter.get_account_info()
+            balance = info.balance
+        except Exception as e:
+            return False, f"Balance fetch failed: {e}"
+
+        if balance <= 0:
+            return False, "Invalid balance"
+
+        # Bugün kapanan trade'lerin toplam PnL'ini hesapla
+        today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+        result = await db.execute(
+            select(func.coalesce(func.sum(Trade.pnl), 0)).where(
+                Trade.user_id == config.user_id,
+                Trade.status == OrderStatus.CLOSED,
+                Trade.closed_at >= today_start,
+                Trade.pnl.isnot(None),
+            )
+        )
+        daily_pnl = float(result.scalar() or 0)
+
+        # Kayıp miktarı balance'ın max_daily_loss_pct'ini aştı mı?
+        max_loss = balance * (config.max_daily_loss_pct / 100.0)
+        if daily_pnl < 0 and abs(daily_pnl) >= max_loss:
+            return False, (
+                f"Daily loss limit reached: {daily_pnl:.2f} / -{max_loss:.2f} "
+                f"({config.max_daily_loss_pct}% of {balance:.2f})"
+            )
+
+        return True, "OK"
+
+
 class RiskManager:
+    """4. Kapı: Lot size hesabı + SL/TP.
+    Dashboard'daki max_risk_per_trade_pct ayarını kullanır."""
+
     @staticmethod
     async def calculate(
         signal: Signal,
@@ -133,6 +187,7 @@ class RiskManager:
 
         price = ask if signal.side == OrderSide.BUY else bid
 
+        # SL/TP mesafesi
         sl_distance_pct = max(min_stop_pct / 100.0 * 1.5, 0.001)
 
         if signal.side == OrderSide.BUY:
@@ -142,10 +197,29 @@ class RiskManager:
             stop_loss   = round(price * (1 + sl_distance_pct), 5)
             take_profit = round(price * (1 - sl_distance_pct * 2), 5)
 
-        lot_size = float(min_size)
+        # Lot size: max_risk_per_trade_pct bazlı hesap
+        if config.max_risk_per_trade_pct and config.max_risk_per_trade_pct > 0:
+            try:
+                info = await adapter.get_account_info()
+                balance = info.balance
+                if balance > 0:
+                    risk_amount  = balance * (config.max_risk_per_trade_pct / 100.0)
+                    sl_distance  = abs(price - stop_loss)
+                    if sl_distance > 0:
+                        calculated_lot = round(risk_amount / (sl_distance * 100), 2)
+                        # min_size ile max(1 lot veya hesaplanan) arasında clamp
+                        lot_size = max(float(min_size), min(calculated_lot, float(min_size) * 10))
+                    else:
+                        lot_size = float(min_size)
+                else:
+                    lot_size = float(min_size)
+            except Exception:
+                lot_size = float(min_size)
+        else:
+            lot_size = float(min_size)
 
         logger.info(
-            f"[{signal.symbol}] Rules: min_size={min_size} min_stop_pct={min_stop_pct}% "
+            f"[{signal.symbol}] Rules: min_size={min_size} risk_pct={config.max_risk_per_trade_pct}% "
             f"→ lot={lot_size} sl={stop_loss} tp={take_profit}"
         )
 
@@ -158,6 +232,8 @@ class RiskManager:
 
 
 class OrderExecutor:
+    """5. Kapı: Capital.com'a emir gönder + DB'ye trade kaydet."""
+
     @staticmethod
     async def execute(
         signal: Signal,
@@ -207,14 +283,10 @@ class OrderExecutor:
 # ─────────────────────── STRATEGY ENGINE ───────────────────────
 
 class StrategyEngine:
-    """RSI momentum stratejisi.
-    
-    RSI > 50 = yukarı momentum = BUY
-    RSI < 50 = aşağı momentum = SELL
-    
-    Ek filtre: SMA20 trend konfirmasyonu
-    BUY için: RSI > 50 VE fiyat SMA20 üzerinde
-    SELL için: RSI < 50 VE fiyat SMA20 altında
+    """RSI momentum + SMA trend konfirmasyonu.
+
+    BUY:  RSI > 50 VE fiyat SMA20 üzerinde (yukarı momentum + trend)
+    SELL: RSI < 50 VE fiyat SMA20 altında (aşağı momentum + trend)
     """
 
     @staticmethod
@@ -253,7 +325,6 @@ class StrategyEngine:
         confidence = 0.0
         reasoning  = ""
 
-        # RSI momentum + SMA trend konfirmasyonu
         if last_rsi > 50 and last_close > last_sma:
             side       = OrderSide.BUY
             confidence = min(0.5 + (last_rsi - 50) / 100, 0.95)
@@ -357,6 +428,12 @@ class TradingBot:
             logger.warning("Watchlist empty, nothing to scan")
             return
 
+        # Günlük kayıp limiti kontrolü (tüm scan için bir kez)
+        ok, msg = await DailyLossGuard.check(config, db, broker, adapter)
+        if not ok:
+            logger.warning(f"Daily loss limit hit — scan paused: {msg}")
+            return
+
         try:
             live_positions = await adapter.get_open_orders()
         except Exception as e:
@@ -375,7 +452,8 @@ class TradingBot:
         logger.info(
             f"Scanning {len(symbols)} symbols | "
             f"open={ctx.open_count} | "
-            f"user={config.user_id}"
+            f"daily_loss_pct={config.max_daily_loss_pct}% | "
+            f"risk_per_trade={config.max_risk_per_trade_pct}%"
         )
 
         processed = 0
@@ -440,7 +518,7 @@ class TradingBot:
             logger.info(f"[{symbol}] REJECTED at RiskManager: {msg}")
             return
 
-        # Gate 4: Order Executor
+        # Gate 4: Order Executor (sadece LIVE modda)
         if config.trade_mode != TradeMode.LIVE:
             logger.info(f"[{symbol}] PAPER mode — order not sent")
             return
