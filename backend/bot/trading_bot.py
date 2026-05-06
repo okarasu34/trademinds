@@ -1,12 +1,11 @@
 """
 TradeMinds bot core — pipeline architecture.
 
-Her sinyal şu kapılardan geçmek zorunda:
-  Strategy Engine → Signal Validator → Position Guard → Risk Manager → Order Executor
-
-Fix: RiskManager artık Capital.com'dan sembol kurallarını çekiyor.
-     Minimum lot size ve stop distance sembol bazında doğru hesaplanıyor.
-Fix: Position Guard local cache kullanıyor — race condition yok.
+Fix: RSI yönü düzeltildi — momentum bazlı:
+     RSI > 50 = yukarı momentum = BUY
+     RSI < 50 = aşağı momentum = SELL
+Fix: Position Guard local cache — race condition yok.
+Fix: RiskManager Capital.com min lot size kullanıyor.
 """
 import asyncio
 import hashlib
@@ -43,15 +42,13 @@ class Signal:
     timestamp: datetime
 
     def idempotency_key(self) -> str:
-        bucket = int(self.timestamp.timestamp() / 300)  # 5 dk bucket
+        bucket = int(self.timestamp.timestamp() / 300)
         raw = f"{self.user_id}:{self.symbol}:{self.side.value}:{bucket}"
         return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
 @dataclass
 class ScanContext:
-    """Tek bir scan boyunca paylaşılan context.
-    open_symbols: scan başında Capital.com'dan çekilen + scan boyunca açılan semboller."""
     open_symbols: set = field(default_factory=set)
     open_count: int = 0
     market_counts: dict = field(default_factory=dict)
@@ -60,8 +57,6 @@ class ScanContext:
 # ─────────────────────── PIPELINE GATES ───────────────────────
 
 class SignalValidator:
-    """1. Kapı: Idempotency check — Redis tabanlı duplicate önleme."""
-
     @staticmethod
     async def validate(signal: Signal) -> tuple[bool, str]:
         key = f"signal:processed:{signal.idempotency_key()}"
@@ -73,9 +68,6 @@ class SignalValidator:
 
 
 class PositionGuard:
-    """2. Kapı: Local cache tabanlı pozisyon kontrolü.
-    Capital.com gecikme race condition'ını önler."""
-
     @staticmethod
     def check(
         signal: Signal,
@@ -100,7 +92,6 @@ class PositionGuard:
 
     @staticmethod
     def register_open(signal: Signal, ctx: ScanContext):
-        """Emir açıldıktan sonra local cache'i güncelle."""
         ctx.open_symbols.add(signal.symbol)
         ctx.open_count += 1
         market_key = signal.market_type.value
@@ -111,7 +102,7 @@ class PositionGuard:
         s = symbol.upper()
         if any(c in s for c in ("BTC", "ETH", "XRP", "DOGE", "SOL", "ADA", "AAVE", "AVAX", "LTC", "SHIB", "PEPE", "TRX", "HBAR", "XLM", "ALPHA", "USDT")):
             return "crypto"
-        if any(c in s for c in ("XAU", "XAG", "OIL", "GAS", "GOLD", "SILVER", "PLATINUM", "PALLADIUM")):
+        if any(c in s for c in ("XAU", "XAG", "OIL", "GAS", "GOLD", "SILVER", "PLATINUM", "PALLADIUM", "COPPER")):
             return "commodity"
         if any(c in s for c in ("SPX", "NDX", "DJI", "DAX", "FTSE", "NKY", "US100", "US500", "US30", "DE40")):
             return "index"
@@ -121,9 +112,6 @@ class PositionGuard:
 
 
 class RiskManager:
-    """3. Kapı: Capital.com'dan sembol kurallarını çekip lot size ve SL/TP hesaplar.
-    Minimum lot size sembol bazında — artık invalid.size.minvalue hatası yok."""
-
     @staticmethod
     async def calculate(
         signal: Signal,
@@ -145,9 +133,7 @@ class RiskManager:
 
         price = ask if signal.side == OrderSide.BUY else bid
 
-        # Stop distance: Capital.com minimum stop distance'ına uy
-        # minStopOrProfitDistance PERCENTAGE ise: price * pct / 100
-        sl_distance_pct = max(min_stop_pct / 100.0 * 1.5, 0.001)  # min'in 1.5 katı, güvenli marj
+        sl_distance_pct = max(min_stop_pct / 100.0 * 1.5, 0.001)
 
         if signal.side == OrderSide.BUY:
             stop_loss   = round(price * (1 - sl_distance_pct), 5)
@@ -156,7 +142,6 @@ class RiskManager:
             stop_loss   = round(price * (1 + sl_distance_pct), 5)
             take_profit = round(price * (1 - sl_distance_pct * 2), 5)
 
-        # Lot size: minimum'u kullan (demo test için yeterli)
         lot_size = float(min_size)
 
         logger.info(
@@ -173,8 +158,6 @@ class RiskManager:
 
 
 class OrderExecutor:
-    """4. Kapı: Capital.com'a emir gönder + DB'ye trade kaydet."""
-
     @staticmethod
     async def execute(
         signal: Signal,
@@ -196,23 +179,23 @@ class OrderExecutor:
             return False, "Capital.com returned no dealReference", None
 
         trade = Trade(
-            user_id        = signal.user_id,
-            broker_id      = signal.broker_id,
-            strategy_id    = None,
-            symbol         = signal.symbol,
-            market_type    = signal.market_type,
-            side           = signal.side,
-            status         = OrderStatus.OPEN,
-            trade_mode     = TradeMode(config.trade_mode.value),
-            entry_price    = risk_params["entry_price"],
-            lot_size       = risk_params["lot_size"],
-            stop_loss      = risk_params["stop_loss"],
-            take_profit    = risk_params["take_profit"],
-            ai_reasoning   = signal.reasoning,
-            ai_confidence  = signal.confidence,
-            signals_used   = signal.indicators,
+            user_id         = signal.user_id,
+            broker_id       = signal.broker_id,
+            strategy_id     = None,
+            symbol          = signal.symbol,
+            market_type     = signal.market_type,
+            side            = signal.side,
+            status          = OrderStatus.OPEN,
+            trade_mode      = TradeMode(config.trade_mode.value),
+            entry_price     = risk_params["entry_price"],
+            lot_size        = risk_params["lot_size"],
+            stop_loss       = risk_params["stop_loss"],
+            take_profit     = risk_params["take_profit"],
+            ai_reasoning    = signal.reasoning,
+            ai_confidence   = signal.confidence,
+            signals_used    = signal.indicators,
             broker_order_id = deal_ref,
-            opened_at      = datetime.utcnow(),
+            opened_at       = datetime.utcnow(),
         )
         db.add(trade)
         await db.commit()
@@ -224,7 +207,15 @@ class OrderExecutor:
 # ─────────────────────── STRATEGY ENGINE ───────────────────────
 
 class StrategyEngine:
-    """RSI tabanlı strateji — test için gevşek eşikler."""
+    """RSI momentum stratejisi.
+    
+    RSI > 50 = yukarı momentum = BUY
+    RSI < 50 = aşağı momentum = SELL
+    
+    Ek filtre: SMA20 trend konfirmasyonu
+    BUY için: RSI > 50 VE fiyat SMA20 üzerinde
+    SELL için: RSI < 50 VE fiyat SMA20 altında
+    """
 
     @staticmethod
     async def generate_signal(
@@ -262,21 +253,21 @@ class StrategyEngine:
         confidence = 0.0
         reasoning  = ""
 
-        # TEST: gevşek eşikler
-        if last_rsi < 50:
+        # RSI momentum + SMA trend konfirmasyonu
+        if last_rsi > 50 and last_close > last_sma:
             side       = OrderSide.BUY
-            confidence = min(0.5 + (50 - last_rsi) / 100, 0.95)
-            reasoning  = f"TEST: RSI={last_rsi:.1f} < 50 → BUY"
-        elif last_rsi > 50:
-            side       = OrderSide.SELL
             confidence = min(0.5 + (last_rsi - 50) / 100, 0.95)
-            reasoning  = f"TEST: RSI={last_rsi:.1f} > 50 → SELL"
+            reasoning  = f"RSI={last_rsi:.1f} > 50 + price above SMA20 → BUY"
+        elif last_rsi < 50 and last_close < last_sma:
+            side       = OrderSide.SELL
+            confidence = min(0.5 + (50 - last_rsi) / 100, 0.95)
+            reasoning  = f"RSI={last_rsi:.1f} < 50 + price below SMA20 → SELL"
 
         if side is None:
             return None
 
-        inferred    = PositionGuard._infer_market(symbol)
-        market_map  = {
+        inferred   = PositionGuard._infer_market(symbol)
+        market_map = {
             "crypto":    MarketType.CRYPTO,
             "commodity": MarketType.COMMODITY,
             "index":     MarketType.INDEX,
@@ -286,27 +277,25 @@ class StrategyEngine:
         market_type = market_map.get(inferred, MarketType.FOREX)
 
         return Signal(
-            user_id    = user_id,
-            broker_id  = broker_id,
-            symbol     = symbol,
+            user_id     = user_id,
+            broker_id   = broker_id,
+            symbol      = symbol,
             market_type = market_type,
-            side       = side,
-            confidence = confidence,
-            reasoning  = reasoning,
-            indicators = {
+            side        = side,
+            confidence  = confidence,
+            reasoning   = reasoning,
+            indicators  = {
                 "rsi":   round(last_rsi, 2),
                 "sma20": round(last_sma, 5),
                 "close": round(last_close, 5),
             },
-            timestamp  = datetime.utcnow(),
+            timestamp   = datetime.utcnow(),
         )
 
 
 # ─────────────────────── MAIN BOT ───────────────────────
 
 class TradingBot:
-    """Ana bot: scheduler her 5 dakikada bir scan() çağırır."""
-
     def __init__(self):
         self._adapter_cache: dict[str, CapitalAdapter] = {}
 
@@ -327,7 +316,6 @@ class TradingBot:
         return adapter
 
     async def scan(self):
-        """Scheduler'ın çağırdığı ana giriş noktası."""
         logger.info(">>> Bot scan started")
 
         async with AsyncSessionLocal() as db:
@@ -369,7 +357,6 @@ class TradingBot:
             logger.warning("Watchlist empty, nothing to scan")
             return
 
-        # Scan başında Capital.com'dan pozisyon snapshot'ı al
         try:
             live_positions = await adapter.get_open_orders()
         except Exception as e:
@@ -410,7 +397,6 @@ class TradingBot:
         symbol: str,
         ctx: ScanContext,
     ):
-        # Strategy engine
         signal = await StrategyEngine.generate_signal(
             user_id   = config.user_id,
             broker_id = broker.id,
@@ -422,16 +408,15 @@ class TradingBot:
 
         logger.info(f"[{symbol}] Signal: {signal.side.value} conf={signal.confidence:.2f}")
 
-        # AI signal log
         log = AISignalLog(
-            user_id    = signal.user_id,
-            symbol     = signal.symbol,
+            user_id     = signal.user_id,
+            symbol      = signal.symbol,
             market_type = signal.market_type,
-            signal     = signal.side.value,
-            confidence = signal.confidence,
-            reasoning  = signal.reasoning,
-            indicators = signal.indicators,
-            acted_on   = False,
+            signal      = signal.side.value,
+            confidence  = signal.confidence,
+            reasoning   = signal.reasoning,
+            indicators  = signal.indicators,
+            acted_on    = False,
         )
         db.add(log)
         await db.commit()
@@ -455,7 +440,7 @@ class TradingBot:
             logger.info(f"[{symbol}] REJECTED at RiskManager: {msg}")
             return
 
-        # Gate 4: Order Executor (sadece LIVE modda)
+        # Gate 4: Order Executor
         if config.trade_mode != TradeMode.LIVE:
             logger.info(f"[{symbol}] PAPER mode — order not sent")
             return
