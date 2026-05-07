@@ -1,16 +1,13 @@
 """
 TradeMinds bot core — pipeline architecture.
 
-Tüm dashboard ayarları aktif:
-- max_risk_per_trade_pct → lot size hesabında kullanılır
-- max_daily_loss_pct → günlük kayıp limitini kontrol eder
-- max_positions → pozisyon limiti
-- market_limits → market bazında limit
-- pause_on_high_impact_news → haber kontrolü (ileride)
+Fix: SL/TP mesafeleri sembol tipine göre gerçekçi değerlere ayarlandı.
+     Forex: %0.3, Crypto: %1.5, Index: %0.5, Commodity: %0.8, Stock: %1.0
+     Dashboard'daki ayarlar tam aktif.
 """
 import asyncio
 import hashlib
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Optional
 from dataclasses import dataclass, field
 
@@ -26,6 +23,20 @@ from db.models import (
 from db.redis_client import cache_set, cache_get
 from brokers.capital_adapter import CapitalAdapter
 from bot.indicators import calculate_indicators
+
+
+# ─────────────────────── SL/TP MESAFE TABLOSU ───────────────────────
+
+# Her market tipi için varsayılan SL mesafesi (%)
+# TP = SL * tp_ratio (1:2 risk/reward)
+MARKET_SL_PCT = {
+    "forex":     0.30,   # %0.3 — tipik forex volatilitesi
+    "crypto":    1.50,   # %1.5 — yüksek volatilite
+    "index":     0.50,   # %0.5 — endeks
+    "commodity": 0.80,   # %0.8 — emtia
+    "stock":     1.00,   # %1.0 — hisse
+}
+TP_RATIO = 2.0  # 1:2 risk/reward
 
 
 # ─────────────────────── DATA CLASSES ───────────────────────
@@ -117,8 +128,7 @@ class PositionGuard:
 
 
 class DailyLossGuard:
-    """3. Kapı: Günlük kayıp limiti kontrolü.
-    Dashboard'daki max_daily_loss_pct ayarını kullanır."""
+    """3. Kapı: Günlük kayıp limiti kontrolü."""
 
     @staticmethod
     async def check(
@@ -139,7 +149,6 @@ class DailyLossGuard:
         if balance <= 0:
             return False, "Invalid balance"
 
-        # Bugün kapanan trade'lerin toplam PnL'ini hesapla
         today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
         result = await db.execute(
             select(func.coalesce(func.sum(Trade.pnl), 0)).where(
@@ -150,9 +159,8 @@ class DailyLossGuard:
             )
         )
         daily_pnl = float(result.scalar() or 0)
+        max_loss  = balance * (config.max_daily_loss_pct / 100.0)
 
-        # Kayıp miktarı balance'ın max_daily_loss_pct'ini aştı mı?
-        max_loss = balance * (config.max_daily_loss_pct / 100.0)
         if daily_pnl < 0 and abs(daily_pnl) >= max_loss:
             return False, (
                 f"Daily loss limit reached: {daily_pnl:.2f} / -{max_loss:.2f} "
@@ -163,8 +171,13 @@ class DailyLossGuard:
 
 
 class RiskManager:
-    """4. Kapı: Lot size hesabı + SL/TP.
-    Dashboard'daki max_risk_per_trade_pct ayarını kullanır."""
+    """4. Kapı: Lot size + SL/TP hesabı.
+    
+    SL mesafesi sembol tipine göre gerçekçi değerler kullanır:
+    - Forex: %0.3, Crypto: %1.5, Index: %0.5, Commodity: %0.8
+    
+    Lot size = (balance * risk_pct) / (price * sl_distance)
+    """
 
     @staticmethod
     async def calculate(
@@ -177,50 +190,65 @@ class RiskManager:
         except Exception as e:
             return False, f"Market rules fetch failed: {e}", None
 
-        min_size     = rules.get("min_size", 1.0)
-        min_stop_pct = rules.get("min_stop_pct", 0.1)
-        bid          = rules.get("bid", 0)
-        ask          = rules.get("ask", 0)
+        min_size = rules.get("min_size", 1.0)
+        bid      = rules.get("bid", 0)
+        ask      = rules.get("ask", 0)
 
         if not bid or not ask:
             return False, f"Invalid price for {signal.symbol}", None
 
         price = ask if signal.side == OrderSide.BUY else bid
 
-        # SL/TP mesafesi
-        sl_distance_pct = max(min_stop_pct / 100.0 * 1.5, 0.001)
+        # Sembol tipine göre SL mesafesi
+        market_key    = PositionGuard._infer_market(signal.symbol)
+        sl_pct        = MARKET_SL_PCT.get(market_key, 0.50) / 100.0
+        sl_distance   = price * sl_pct
+        tp_distance   = sl_distance * TP_RATIO
 
         if signal.side == OrderSide.BUY:
-            stop_loss   = round(price * (1 - sl_distance_pct), 5)
-            take_profit = round(price * (1 + sl_distance_pct * 2), 5)
+            stop_loss   = round(price - sl_distance, 5)
+            take_profit = round(price + tp_distance, 5)
         else:
-            stop_loss   = round(price * (1 + sl_distance_pct), 5)
-            take_profit = round(price * (1 - sl_distance_pct * 2), 5)
+            stop_loss   = round(price + sl_distance, 5)
+            take_profit = round(price - tp_distance, 5)
 
-        # Lot size: max_risk_per_trade_pct bazlı hesap
-        if config.max_risk_per_trade_pct and config.max_risk_per_trade_pct > 0:
-            try:
-                info = await adapter.get_account_info()
-                balance = info.balance
-                if balance > 0:
-                    risk_amount  = balance * (config.max_risk_per_trade_pct / 100.0)
-                    sl_distance  = abs(price - stop_loss)
-                    if sl_distance > 0:
-                        calculated_lot = round(risk_amount / (sl_distance * 100), 2)
-                        # min_size ile max(1 lot veya hesaplanan) arasında clamp
-                        lot_size = max(float(min_size), min(calculated_lot, float(min_size) * 10))
-                    else:
-                        lot_size = float(min_size)
-                else:
-                    lot_size = float(min_size)
-            except Exception:
-                lot_size = float(min_size)
+        # Capital.com minimum stop distance kontrolü
+        min_stop_pct    = rules.get("min_stop_pct", 0.01)
+        min_sl_distance = price * (min_stop_pct / 100.0)
+        if sl_distance < min_sl_distance:
+            # Minimum'u aşmıyorsa, minimum'un 1.5 katını kullan
+            sl_distance = min_sl_distance * 1.5
+            tp_distance = sl_distance * TP_RATIO
+            if signal.side == OrderSide.BUY:
+                stop_loss   = round(price - sl_distance, 5)
+                take_profit = round(price + tp_distance, 5)
+            else:
+                stop_loss   = round(price + sl_distance, 5)
+                take_profit = round(price - tp_distance, 5)
+
+        # Lot size hesabı
+        risk_pct    = (config.max_risk_per_trade_pct or 1.0) / 100.0
+        try:
+            info    = await adapter.get_account_info()
+            balance = info.balance if info.balance > 0 else 10000
+        except Exception:
+            balance = 10000
+
+        risk_amount = balance * risk_pct
+        if sl_distance > 0:
+            calculated_lot = risk_amount / (sl_distance * 100)
         else:
-            lot_size = float(min_size)
+            calculated_lot = float(min_size)
+
+        # min_size ile clamp — max 10x min_size
+        lot_size = max(float(min_size), min(round(calculated_lot, 2), float(min_size) * 10))
 
         logger.info(
-            f"[{signal.symbol}] Rules: min_size={min_size} risk_pct={config.max_risk_per_trade_pct}% "
-            f"→ lot={lot_size} sl={stop_loss} tp={take_profit}"
+            f"[{signal.symbol}] {market_key} | "
+            f"sl={sl_pct*100:.2f}% | "
+            f"risk={config.max_risk_per_trade_pct}% | "
+            f"lot={lot_size} | "
+            f"sl_price={stop_loss} tp_price={take_profit}"
         )
 
         return True, "OK", {
@@ -285,8 +313,8 @@ class OrderExecutor:
 class StrategyEngine:
     """RSI momentum + SMA trend konfirmasyonu.
 
-    BUY:  RSI > 50 VE fiyat SMA20 üzerinde (yukarı momentum + trend)
-    SELL: RSI < 50 VE fiyat SMA20 altında (aşağı momentum + trend)
+    BUY:  RSI > 50 VE fiyat SMA20 üzerinde
+    SELL: RSI < 50 VE fiyat SMA20 altında
     """
 
     @staticmethod
@@ -428,7 +456,7 @@ class TradingBot:
             logger.warning("Watchlist empty, nothing to scan")
             return
 
-        # Günlük kayıp limiti kontrolü (tüm scan için bir kez)
+        # Günlük kayıp limiti kontrolü
         ok, msg = await DailyLossGuard.check(config, db, broker, adapter)
         if not ok:
             logger.warning(f"Daily loss limit hit — scan paused: {msg}")
@@ -452,8 +480,8 @@ class TradingBot:
         logger.info(
             f"Scanning {len(symbols)} symbols | "
             f"open={ctx.open_count} | "
-            f"daily_loss_pct={config.max_daily_loss_pct}% | "
-            f"risk_per_trade={config.max_risk_per_trade_pct}%"
+            f"risk={config.max_risk_per_trade_pct}% | "
+            f"daily_loss_limit={config.max_daily_loss_pct}%"
         )
 
         processed = 0
