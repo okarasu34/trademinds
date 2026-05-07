@@ -1,9 +1,13 @@
 """
-TradeMinds bot core — pipeline architecture.
+TradeMinds bot core — pipeline architecture + 3 strateji.
 
-Fix: SL/TP mesafeleri sembol tipine göre gerçekçi değerlere ayarlandı.
-     Forex: %0.3, Crypto: %1.5, Index: %0.5, Commodity: %0.8, Stock: %1.0
-     Dashboard'daki ayarlar tam aktif.
+Stratejiler DB'den çekilir, aktif olan kullanılır:
+  1. AlphaTrendStrategy   — Alpha Trend crossover + EMA hizalaması
+  2. RSIDivergenceStrategy — RSI + MACD diverjans + Fibonacci seviyeleri
+  3. SmartMoneyStrategy   — Order Block + FVG + POC
+
+Pipeline:
+  Strategy Engine → Signal Validator → Position Guard → Risk Manager → Order Executor
 """
 import asyncio
 import hashlib
@@ -17,7 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.database import AsyncSessionLocal
 from db.models import (
-    BotConfig, BotStatus, BrokerAccount, Trade,
+    BotConfig, BotStatus, BrokerAccount, Trade, Strategy,
     OrderSide, OrderStatus, TradeMode, MarketType, AISignalLog
 )
 from db.redis_client import cache_set, cache_get
@@ -27,16 +31,14 @@ from bot.indicators import calculate_indicators
 
 # ─────────────────────── SL/TP MESAFE TABLOSU ───────────────────────
 
-# Her market tipi için varsayılan SL mesafesi (%)
-# TP = SL * tp_ratio (1:2 risk/reward)
 MARKET_SL_PCT = {
-    "forex":     0.30,   # %0.3 — tipik forex volatilitesi
-    "crypto":    1.50,   # %1.5 — yüksek volatilite
-    "index":     0.50,   # %0.5 — endeks
-    "commodity": 0.80,   # %0.8 — emtia
-    "stock":     1.00,   # %1.0 — hisse
+    "forex":     0.30,
+    "crypto":    1.50,
+    "index":     0.50,
+    "commodity": 0.80,
+    "stock":     1.00,
 }
-TP_RATIO = 2.0  # 1:2 risk/reward
+TP_RATIO = 2.0
 
 
 # ─────────────────────── DATA CLASSES ───────────────────────
@@ -52,6 +54,7 @@ class Signal:
     reasoning: str
     indicators: dict
     timestamp: datetime
+    strategy_id: Optional[str] = None
 
     def idempotency_key(self) -> str:
         bucket = int(self.timestamp.timestamp() / 300)
@@ -66,11 +69,209 @@ class ScanContext:
     market_counts: dict = field(default_factory=dict)
 
 
+# ─────────────────────── STRATEJI SINIFLAR ───────────────────────
+
+class AlphaTrendStrategy:
+    """
+    Strateji 1: Alpha Trend + EMA Hizalaması
+
+    BUY koşulları (ikisi birden):
+      - Alpha Trend yukarı döndü (cross_up)
+      - EMA13 > EMA21 (kısa vade yukarı)
+      - Fiyat EMA89 üzerinde (orta vade trend yukarı)
+
+    SELL koşulları (ikisi birden):
+      - Alpha Trend aşağı döndü (cross_down)
+      - EMA13 < EMA21 (kısa vade aşağı)
+      - Fiyat EMA89 altında (orta vade trend aşağı)
+    """
+
+    @staticmethod
+    def generate(ind: dict, params: dict) -> Optional[tuple[OrderSide, float, str]]:
+        at_cross_up   = ind.get("alpha_trend_cross_up", False)
+        at_cross_down = ind.get("alpha_trend_cross_down", False)
+        ema13_gt_21   = ind.get("ema13_above_ema21", False)
+        ema13_gt_89   = ind.get("ema13_above_ema89", False)
+        rsi           = ind.get("rsi_13", 50)
+        macd_cross    = ind.get("macd13_crossover", "bearish")
+
+        # BUY
+        if at_cross_up and ema13_gt_21 and ema13_gt_89:
+            confidence = 0.65
+            if macd_cross == "bullish":
+                confidence += 0.10
+            if rsi > 50:
+                confidence += 0.05
+            return (
+                OrderSide.BUY,
+                min(confidence, 0.95),
+                f"AlphaTrend cross UP | EMA13>{ind.get('ema_13','?')} > EMA21 | RSI={rsi:.1f}"
+            )
+
+        # SELL
+        if at_cross_down and not ema13_gt_21 and not ema13_gt_89:
+            confidence = 0.65
+            if macd_cross == "bearish":
+                confidence += 0.10
+            if rsi < 50:
+                confidence += 0.05
+            return (
+                OrderSide.SELL,
+                min(confidence, 0.95),
+                f"AlphaTrend cross DOWN | EMA13 < EMA21 | RSI={rsi:.1f}"
+            )
+
+        return None
+
+
+class RSIDivergenceStrategy:
+    """
+    Strateji 2: RSI + MACD Diverjans + Fibonacci
+
+    BUY koşulları:
+      - RSI bullish diverjans VE MACD bullish diverjans (en az 1 tanesi)
+      - MACD histogram yukarı crossover
+      - Fiyat Fibonacci %38.2 veya %61.8 desteğine yakın
+
+    SELL koşulları:
+      - RSI bearish diverjans VE MACD bearish diverjans (en az 1 tanesi)
+      - MACD histogram aşağı crossover
+      - Fiyat Fibonacci %61.8 veya %78.6 direncine yakın
+    """
+
+    @staticmethod
+    def generate(ind: dict, params: dict) -> Optional[tuple[OrderSide, float, str]]:
+        rsi_bull_div  = ind.get("rsi_bullish_divergence", False)
+        rsi_bear_div  = ind.get("rsi_bearish_divergence", False)
+        macd_bull_div = ind.get("macd_bullish_divergence", False)
+        macd_bear_div = ind.get("macd_bearish_divergence", False)
+        macd_cross_up  = ind.get("macd13_cross_up", False)
+        macd_cross_dn  = ind.get("macd13_cross_down", False)
+        near_fibo      = ind.get("near_fibo_level")
+        rsi            = ind.get("rsi_13", 50)
+
+        min_div = params.get("min_divergence_count", 2)
+        bull_div_count = sum([rsi_bull_div, macd_bull_div])
+        bear_div_count = sum([rsi_bear_div, macd_bear_div])
+
+        # BUY — yeterli bullish diverjans + MACD cross up
+        if bull_div_count >= min_div and macd_cross_up:
+            confidence = 0.60 + bull_div_count * 0.10
+            if near_fibo in ("fibo_382", "fibo_500", "fibo_618"):
+                confidence += 0.10
+            if rsi < 45:
+                confidence += 0.05
+            return (
+                OrderSide.BUY,
+                min(confidence, 0.95),
+                f"RSI+MACD bullish div ({bull_div_count}) | MACD cross up | Fibo={near_fibo} | RSI={rsi:.1f}"
+            )
+
+        # SELL — yeterli bearish diverjans + MACD cross down
+        if bear_div_count >= min_div and macd_cross_dn:
+            confidence = 0.60 + bear_div_count * 0.10
+            if near_fibo in ("fibo_618", "fibo_786", "fibo_1000"):
+                confidence += 0.10
+            if rsi > 55:
+                confidence += 0.05
+            return (
+                OrderSide.SELL,
+                min(confidence, 0.95),
+                f"RSI+MACD bearish div ({bear_div_count}) | MACD cross down | Fibo={near_fibo} | RSI={rsi:.1f}"
+            )
+
+        # Sadece 1 diverjans + güçlü MACD + Fibonacci seviyesi (daha gevşek)
+        if bull_div_count >= 1 and macd_cross_up and near_fibo in ("fibo_382", "fibo_618"):
+            return (
+                OrderSide.BUY,
+                0.65,
+                f"RSI/MACD bullish div + Fibo {near_fibo} destek | RSI={rsi:.1f}"
+            )
+
+        if bear_div_count >= 1 and macd_cross_dn and near_fibo in ("fibo_618", "fibo_786"):
+            return (
+                OrderSide.SELL,
+                0.65,
+                f"RSI/MACD bearish div + Fibo {near_fibo} direnç | RSI={rsi:.1f}"
+            )
+
+        return None
+
+
+class SmartMoneyStrategy:
+    """
+    Strateji 3: Order Block + FVG + POC
+
+    BUY koşulları:
+      - Fiyat bullish order block içinde
+      - POC yakınında (%0.5 mesafe)
+      - Bullish FVG var (boşluk doldurma)
+      - MACD bullish
+
+    SELL koşulları:
+      - Fiyat bearish order block içinde
+      - POC yakınında
+      - Bearish FVG var
+      - MACD bearish
+    """
+
+    @staticmethod
+    def generate(ind: dict, params: dict) -> Optional[tuple[OrderSide, float, str]]:
+        in_bull_ob   = ind.get("in_bullish_ob", False)
+        in_bear_ob   = ind.get("in_bearish_ob", False)
+        near_poc     = ind.get("near_poc", False)
+        bull_fvg     = ind.get("bull_fvg", False)
+        bear_fvg     = ind.get("bear_fvg", False)
+        macd_cross   = ind.get("macd13_crossover", "bearish")
+        poc_prox     = ind.get("poc_proximity_pct", 999)
+        rsi          = ind.get("rsi_13", 50)
+        poc_threshold = params.get("poc_proximity_pct", 0.5)
+
+        # BUY — bullish OB + POC yakın + bullish FVG
+        if in_bull_ob and poc_prox <= poc_threshold:
+            confidence = 0.65
+            if bull_fvg:
+                confidence += 0.10
+            if macd_cross == "bullish":
+                confidence += 0.10
+            if rsi < 50:
+                confidence += 0.05
+            return (
+                OrderSide.BUY,
+                min(confidence, 0.95),
+                f"Bullish OB + POC ({poc_prox:.2f}%) | FVG={bull_fvg} | MACD={macd_cross} | RSI={rsi:.1f}"
+            )
+
+        # SELL — bearish OB + POC yakın + bearish FVG
+        if in_bear_ob and poc_prox <= poc_threshold:
+            confidence = 0.65
+            if bear_fvg:
+                confidence += 0.10
+            if macd_cross == "bearish":
+                confidence += 0.10
+            if rsi > 50:
+                confidence += 0.05
+            return (
+                OrderSide.SELL,
+                min(confidence, 0.95),
+                f"Bearish OB + POC ({poc_prox:.2f}%) | FVG={bear_fvg} | MACD={macd_cross} | RSI={rsi:.1f}"
+            )
+
+        return None
+
+
+# ─────────────────────── STRATEJİ FACTORY ───────────────────────
+
+STRATEGY_MAP = {
+    "Alpha Trend":      AlphaTrendStrategy,
+    "RSI Divergence":   RSIDivergenceStrategy,
+    "Smart Money":      SmartMoneyStrategy,
+}
+
+
 # ─────────────────────── PIPELINE GATES ───────────────────────
 
 class SignalValidator:
-    """1. Kapı: Idempotency check."""
-
     @staticmethod
     async def validate(signal: Signal) -> tuple[bool, str]:
         key = f"signal:processed:{signal.idempotency_key()}"
@@ -82,20 +283,12 @@ class SignalValidator:
 
 
 class PositionGuard:
-    """2. Kapı: Local cache tabanlı pozisyon kontrolü."""
-
     @staticmethod
-    def check(
-        signal: Signal,
-        ctx: ScanContext,
-        config: BotConfig,
-    ) -> tuple[bool, str]:
+    def check(signal: Signal, ctx: ScanContext, config: BotConfig) -> tuple[bool, str]:
         if signal.symbol in ctx.open_symbols:
             return False, f"Position already open: {signal.symbol}"
-
         if ctx.open_count >= config.max_positions:
             return False, f"Max positions reached ({ctx.open_count}/{config.max_positions})"
-
         market_limits = config.market_limits or {}
         market_key    = signal.market_type.value
         market_limit  = market_limits.get(market_key)
@@ -103,7 +296,6 @@ class PositionGuard:
             current = ctx.market_counts.get(market_key, 0)
             if current >= market_limit:
                 return False, f"Market limit reached: {market_key} {current}/{market_limit}"
-
         return True, "OK"
 
     @staticmethod
@@ -128,27 +320,17 @@ class PositionGuard:
 
 
 class DailyLossGuard:
-    """3. Kapı: Günlük kayıp limiti kontrolü."""
-
     @staticmethod
-    async def check(
-        config: BotConfig,
-        db: AsyncSession,
-        broker: BrokerAccount,
-        adapter: CapitalAdapter,
-    ) -> tuple[bool, str]:
+    async def check(config: BotConfig, db: AsyncSession, broker: BrokerAccount, adapter: CapitalAdapter) -> tuple[bool, str]:
         if not config.max_daily_loss_pct or config.max_daily_loss_pct <= 0:
             return True, "OK"
-
         try:
-            info = await adapter.get_account_info()
+            info    = await adapter.get_account_info()
             balance = info.balance
         except Exception as e:
             return False, f"Balance fetch failed: {e}"
-
         if balance <= 0:
             return False, "Invalid balance"
-
         today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
         result = await db.execute(
             select(func.coalesce(func.sum(Trade.pnl), 0)).where(
@@ -160,50 +342,38 @@ class DailyLossGuard:
         )
         daily_pnl = float(result.scalar() or 0)
         max_loss  = balance * (config.max_daily_loss_pct / 100.0)
-
         if daily_pnl < 0 and abs(daily_pnl) >= max_loss:
-            return False, (
-                f"Daily loss limit reached: {daily_pnl:.2f} / -{max_loss:.2f} "
-                f"({config.max_daily_loss_pct}% of {balance:.2f})"
-            )
-
+            return False, f"Daily loss limit reached: {daily_pnl:.2f} / -{max_loss:.2f}"
         return True, "OK"
 
 
 class RiskManager:
-    """4. Kapı: Lot size + SL/TP hesabı.
-    
-    SL mesafesi sembol tipine göre gerçekçi değerler kullanır:
-    - Forex: %0.3, Crypto: %1.5, Index: %0.5, Commodity: %0.8
-    
-    Lot size = (balance * risk_pct) / (price * sl_distance)
-    """
-
     @staticmethod
-    async def calculate(
-        signal: Signal,
-        adapter: CapitalAdapter,
-        config: BotConfig,
-    ) -> tuple[bool, str, Optional[dict]]:
+    async def calculate(signal: Signal, adapter: CapitalAdapter, config: BotConfig) -> tuple[bool, str, Optional[dict]]:
         try:
             rules = await adapter.get_market_rules(signal.symbol)
         except Exception as e:
             return False, f"Market rules fetch failed: {e}", None
 
-        min_size = rules.get("min_size", 1.0)
-        bid      = rules.get("bid", 0)
-        ask      = rules.get("ask", 0)
+        min_size     = rules.get("min_size", 1.0)
+        min_stop_pct = rules.get("min_stop_pct", 0.1)
+        bid          = rules.get("bid", 0)
+        ask          = rules.get("ask", 0)
 
         if not bid or not ask:
             return False, f"Invalid price for {signal.symbol}", None
 
         price = ask if signal.side == OrderSide.BUY else bid
 
-        # Sembol tipine göre SL mesafesi
         market_key    = PositionGuard._infer_market(signal.symbol)
         sl_pct        = MARKET_SL_PCT.get(market_key, 0.50) / 100.0
         sl_distance   = price * sl_pct
         tp_distance   = sl_distance * TP_RATIO
+
+        min_sl_distance = price * (min_stop_pct / 100.0)
+        if sl_distance < min_sl_distance:
+            sl_distance = min_sl_distance * 1.5
+            tp_distance = sl_distance * TP_RATIO
 
         if signal.side == OrderSide.BUY:
             stop_loss   = round(price - sl_distance, 5)
@@ -212,42 +382,20 @@ class RiskManager:
             stop_loss   = round(price + sl_distance, 5)
             take_profit = round(price - tp_distance, 5)
 
-        # Capital.com minimum stop distance kontrolü
-        min_stop_pct    = rules.get("min_stop_pct", 0.01)
-        min_sl_distance = price * (min_stop_pct / 100.0)
-        if sl_distance < min_sl_distance:
-            # Minimum'u aşmıyorsa, minimum'un 1.5 katını kullan
-            sl_distance = min_sl_distance * 1.5
-            tp_distance = sl_distance * TP_RATIO
-            if signal.side == OrderSide.BUY:
-                stop_loss   = round(price - sl_distance, 5)
-                take_profit = round(price + tp_distance, 5)
-            else:
-                stop_loss   = round(price + sl_distance, 5)
-                take_profit = round(price - tp_distance, 5)
-
-        # Lot size hesabı
-        risk_pct    = (config.max_risk_per_trade_pct or 1.0) / 100.0
+        risk_pct = (config.max_risk_per_trade_pct or 1.0) / 100.0
         try:
             info    = await adapter.get_account_info()
             balance = info.balance if info.balance > 0 else 10000
         except Exception:
             balance = 10000
 
-        risk_amount = balance * risk_pct
-        if sl_distance > 0:
-            calculated_lot = risk_amount / (sl_distance * 100)
-        else:
-            calculated_lot = float(min_size)
-
-        # min_size ile clamp — max 10x min_size
-        lot_size = max(float(min_size), min(round(calculated_lot, 2), float(min_size) * 10))
+        risk_amount    = balance * risk_pct
+        calculated_lot = risk_amount / (sl_distance * 100) if sl_distance > 0 else float(min_size)
+        lot_size       = max(float(min_size), min(round(calculated_lot, 2), float(min_size) * 10))
 
         logger.info(
-            f"[{signal.symbol}] {market_key} | "
-            f"sl={sl_pct*100:.2f}% | "
-            f"risk={config.max_risk_per_trade_pct}% | "
-            f"lot={lot_size} | "
+            f"[{signal.symbol}] {market_key} | sl={sl_pct*100:.2f}% | "
+            f"risk={config.max_risk_per_trade_pct}% | lot={lot_size} | "
             f"sl_price={stop_loss} tp_price={take_profit}"
         )
 
@@ -260,16 +408,8 @@ class RiskManager:
 
 
 class OrderExecutor:
-    """5. Kapı: Capital.com'a emir gönder + DB'ye trade kaydet."""
-
     @staticmethod
-    async def execute(
-        signal: Signal,
-        adapter: CapitalAdapter,
-        risk_params: dict,
-        config: BotConfig,
-        db: AsyncSession,
-    ) -> tuple[bool, str, Optional[Trade]]:
+    async def execute(signal: Signal, adapter: CapitalAdapter, risk_params: dict, config: BotConfig, db: AsyncSession) -> tuple[bool, str, Optional[Trade]]:
         deal_ref = await adapter.place_order(
             symbol      = signal.symbol,
             side        = signal.side.value,
@@ -278,14 +418,13 @@ class OrderExecutor:
             take_profit = risk_params["take_profit"],
             comment     = f"TradeMinds:{signal.idempotency_key()}",
         )
-
         if not deal_ref:
             return False, "Capital.com returned no dealReference", None
 
         trade = Trade(
             user_id         = signal.user_id,
             broker_id       = signal.broker_id,
-            strategy_id     = None,
+            strategy_id     = signal.strategy_id,
             symbol          = signal.symbol,
             market_type     = signal.market_type,
             side            = signal.side,
@@ -304,92 +443,7 @@ class OrderExecutor:
         db.add(trade)
         await db.commit()
         await db.refresh(trade)
-
         return True, f"Order placed: {deal_ref}", trade
-
-
-# ─────────────────────── STRATEGY ENGINE ───────────────────────
-
-class StrategyEngine:
-    """RSI momentum + SMA trend konfirmasyonu.
-
-    BUY:  RSI > 50 VE fiyat SMA20 üzerinde
-    SELL: RSI < 50 VE fiyat SMA20 altında
-    """
-
-    @staticmethod
-    async def generate_signal(
-        user_id: str,
-        broker_id: str,
-        symbol: str,
-        adapter: CapitalAdapter,
-    ) -> Optional[Signal]:
-        try:
-            df = await adapter.get_candles(symbol, "1h", limit=100)
-        except Exception as e:
-            logger.warning(f"[{symbol}] Candle fetch failed: {e}")
-            return None
-
-        if df is None or df.empty or len(df) < 50:
-            return None
-
-        try:
-            ind = calculate_indicators(df)
-        except Exception as e:
-            logger.warning(f"[{symbol}] Indicator error: {e}")
-            return None
-
-        if not ind or "rsi_14" not in ind or "sma_20" not in ind:
-            return None
-
-        last_rsi   = ind["rsi_14"]
-        last_sma   = ind["sma_20"]
-        last_close = float(df["close"].iloc[-1])
-
-        if last_rsi is None or last_sma is None:
-            return None
-
-        side       = None
-        confidence = 0.0
-        reasoning  = ""
-
-        if last_rsi > 50 and last_close > last_sma:
-            side       = OrderSide.BUY
-            confidence = min(0.5 + (last_rsi - 50) / 100, 0.95)
-            reasoning  = f"RSI={last_rsi:.1f} > 50 + price above SMA20 → BUY"
-        elif last_rsi < 50 and last_close < last_sma:
-            side       = OrderSide.SELL
-            confidence = min(0.5 + (50 - last_rsi) / 100, 0.95)
-            reasoning  = f"RSI={last_rsi:.1f} < 50 + price below SMA20 → SELL"
-
-        if side is None:
-            return None
-
-        inferred   = PositionGuard._infer_market(symbol)
-        market_map = {
-            "crypto":    MarketType.CRYPTO,
-            "commodity": MarketType.COMMODITY,
-            "index":     MarketType.INDEX,
-            "stock":     MarketType.STOCK,
-            "forex":     MarketType.FOREX,
-        }
-        market_type = market_map.get(inferred, MarketType.FOREX)
-
-        return Signal(
-            user_id     = user_id,
-            broker_id   = broker_id,
-            symbol      = symbol,
-            market_type = market_type,
-            side        = side,
-            confidence  = confidence,
-            reasoning   = reasoning,
-            indicators  = {
-                "rsi":   round(last_rsi, 2),
-                "sma20": round(last_sma, 5),
-                "close": round(last_close, 5),
-            },
-            timestamp   = datetime.utcnow(),
-        )
 
 
 # ─────────────────────── MAIN BOT ───────────────────────
@@ -405,18 +459,24 @@ class TradingBot:
                 return adapter
             await adapter.disconnect()
             del self._adapter_cache[broker.id]
-
         adapter = CapitalAdapter(broker)
         if not await adapter.connect():
             logger.error(f"Failed to connect to broker {broker.name}")
             return None
-
         self._adapter_cache[broker.id] = adapter
         return adapter
 
+    async def _get_active_strategy(self, db: AsyncSession, user_id: str) -> Optional[Strategy]:
+        result = await db.execute(
+            select(Strategy).where(
+                Strategy.user_id == user_id,
+                Strategy.is_active == True,
+            )
+        )
+        return result.scalars().first()
+
     async def scan(self):
         logger.info(">>> Bot scan started")
-
         async with AsyncSessionLocal() as db:
             try:
                 cfg_result = await db.execute(
@@ -426,16 +486,15 @@ class TradingBot:
                 if not configs:
                     logger.info("No running bots")
                     return
-
                 for config in configs:
                     await self._scan_for_user(db, config)
-
             except Exception as e:
                 logger.exception(f"Scan failed: {e}")
             finally:
                 logger.info("<<< Bot scan finished")
 
     async def _scan_for_user(self, db: AsyncSession, config: BotConfig):
+        # Aktif broker
         br_result = await db.execute(
             select(BrokerAccount).where(
                 BrokerAccount.user_id == config.user_id,
@@ -451,17 +510,31 @@ class TradingBot:
         if not adapter:
             return
 
+        # Aktif strateji
+        strategy = await self._get_active_strategy(db, config.user_id)
+        if not strategy:
+            logger.warning("No active strategy found")
+            return
+
+        strategy_class = STRATEGY_MAP.get(strategy.name)
+        if not strategy_class:
+            logger.warning(f"Unknown strategy: {strategy.name}")
+            return
+
+        logger.info(f"Active strategy: {strategy.name}")
+
         symbols = adapter.get_cached_watchlist_symbols()
         if not symbols:
             logger.warning("Watchlist empty, nothing to scan")
             return
 
-        # Günlük kayıp limiti kontrolü
+        # Günlük kayıp limiti
         ok, msg = await DailyLossGuard.check(config, db, broker, adapter)
         if not ok:
-            logger.warning(f"Daily loss limit hit — scan paused: {msg}")
+            logger.warning(f"Daily loss limit hit: {msg}")
             return
 
+        # Canlı pozisyonlar
         try:
             live_positions = await adapter.get_open_orders()
         except Exception as e:
@@ -478,16 +551,14 @@ class TradingBot:
             ctx.market_counts[mk] = ctx.market_counts.get(mk, 0) + 1
 
         logger.info(
-            f"Scanning {len(symbols)} symbols | "
-            f"open={ctx.open_count} | "
-            f"risk={config.max_risk_per_trade_pct}% | "
-            f"daily_loss_limit={config.max_daily_loss_pct}%"
+            f"Scanning {len(symbols)} symbols | open={ctx.open_count} | "
+            f"strategy={strategy.name} | risk={config.max_risk_per_trade_pct}%"
         )
 
         processed = 0
         for symbol in symbols:
             try:
-                await self._process_symbol(db, config, broker, adapter, symbol, ctx)
+                await self._process_symbol(db, config, broker, adapter, symbol, ctx, strategy, strategy_class)
                 processed += 1
             except Exception as e:
                 logger.exception(f"[{symbol}] Pipeline error: {e}")
@@ -502,18 +573,69 @@ class TradingBot:
         adapter: CapitalAdapter,
         symbol: str,
         ctx: ScanContext,
+        strategy: Strategy,
+        strategy_class,
     ):
-        signal = await StrategyEngine.generate_signal(
-            user_id   = config.user_id,
-            broker_id = broker.id,
-            symbol    = symbol,
-            adapter   = adapter,
-        )
-        if not signal:
+        # Mum verisi çek
+        try:
+            df = await adapter.get_candles(symbol, "1h", limit=200)
+        except Exception as e:
+            logger.warning(f"[{symbol}] Candle fetch failed: {e}")
             return
 
-        logger.info(f"[{symbol}] Signal: {signal.side.value} conf={signal.confidence:.2f}")
+        if df is None or df.empty or len(df) < 50:
+            return
 
+        # İndikatörleri hesapla
+        try:
+            ind = calculate_indicators(df)
+        except Exception as e:
+            logger.warning(f"[{symbol}] Indicator error: {e}")
+            return
+
+        if not ind:
+            return
+
+        # Strateji sinyali üret
+        result = strategy_class.generate(ind, strategy.parameters or {})
+        if not result:
+            return
+
+        side, confidence, reasoning = result
+
+        # Market type
+        inferred   = PositionGuard._infer_market(symbol)
+        market_map = {
+            "crypto":    MarketType.CRYPTO,
+            "commodity": MarketType.COMMODITY,
+            "index":     MarketType.INDEX,
+            "stock":     MarketType.STOCK,
+            "forex":     MarketType.FOREX,
+        }
+        market_type = market_map.get(inferred, MarketType.FOREX)
+
+        signal = Signal(
+            user_id     = config.user_id,
+            broker_id   = broker.id,
+            symbol      = symbol,
+            market_type = market_type,
+            side        = side,
+            confidence  = confidence,
+            reasoning   = reasoning,
+            indicators  = {
+                "rsi":          ind.get("rsi_13"),
+                "macd":         ind.get("macd13"),
+                "alpha_trend":  ind.get("alpha_trend"),
+                "ema_13":       ind.get("ema_13"),
+                "ema_21":       ind.get("ema_21"),
+            },
+            timestamp   = datetime.utcnow(),
+            strategy_id = strategy.id,
+        )
+
+        logger.info(f"[{symbol}] [{strategy.name}] Signal: {side.value} conf={confidence:.2f} | {reasoning}")
+
+        # AI signal log
         log = AISignalLog(
             user_id     = signal.user_id,
             symbol      = signal.symbol,
@@ -546,14 +668,12 @@ class TradingBot:
             logger.info(f"[{symbol}] REJECTED at RiskManager: {msg}")
             return
 
-        # Gate 4: Order Executor (sadece LIVE modda)
+        # Gate 4: Order Executor
         if config.trade_mode != TradeMode.LIVE:
             logger.info(f"[{symbol}] PAPER mode — order not sent")
             return
 
-        ok, msg, trade = await OrderExecutor.execute(
-            signal, adapter, risk_params, config, db
-        )
+        ok, msg, trade = await OrderExecutor.execute(signal, adapter, risk_params, config, db)
         if ok:
             logger.success(f"[{symbol}] ORDER PLACED: {msg}")
             PositionGuard.register_open(signal, ctx)
