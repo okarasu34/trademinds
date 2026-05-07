@@ -1,19 +1,16 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, update
+from sqlalchemy import select
 from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime
-import asyncio
 
 from db.database import get_db
-from db.models import BotConfig, BotStatus, TradeMode, BotHealthLog, User
-from db.redis_client import get_bot_state, cache_get, init_redis, redis_client
+from db.models import BotConfig, BotStatus, TradeMode, BotHealthLog, BrokerAccount, User
+from db.redis_client import get_bot_state
 from api.auth import get_current_user
 
 router = APIRouter()
-
-_bot_registry: dict = {}
 
 
 class BotConfigUpdate(BaseModel):
@@ -26,7 +23,7 @@ class BotConfigUpdate(BaseModel):
 
 
 class TradeModeUpdate(BaseModel):
-    mode: TradeMode
+    mode: str
 
 
 @router.get("/status")
@@ -34,16 +31,31 @@ async def get_bot_status(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    # Bot config
     result = await db.execute(select(BotConfig).where(BotConfig.user_id == user.id))
     config = result.scalar_one_or_none()
     if not config:
         raise HTTPException(status_code=404, detail="Bot config not found")
+
+    # Balance — aktif broker'dan çek
+    broker_result = await db.execute(
+        select(BrokerAccount).where(
+            BrokerAccount.user_id == user.id,
+            BrokerAccount.is_active == True,
+        )
+    )
+    broker = broker_result.scalars().first()
 
     redis_state = await get_bot_state(user.id) or {}
 
     return {
         "status": config.status.value,
         "trade_mode": config.trade_mode.value,
+        "balance": broker.balance if broker else 0,
+        "equity": broker.equity if broker else 0,
+        "currency": broker.currency if broker else "EUR",
+        "last_sync": broker.last_sync.isoformat() if broker and broker.last_sync else None,
+        "is_connected": broker.is_connected if broker else False,
         "redis_state": redis_state,
         "max_positions": config.max_positions,
         "max_daily_loss_pct": config.max_daily_loss_pct,
@@ -66,21 +78,8 @@ async def start_bot(
     if not config:
         raise HTTPException(status_code=404, detail="Bot config not found")
 
-    if config.status == BotStatus.RUNNING and user.id in _bot_registry:
-        return {"message": "Bot already running"}
-
     config.status = BotStatus.RUNNING
     await db.commit()
-
-    # Ensure Redis is connected
-    global redis_client
-    if redis_client is None:
-        await init_redis()
-
-    from bot.trading_bot import TradingBot
-    bot = TradingBot(str(user.id))
-    _bot_registry[user.id] = bot
-    asyncio.create_task(bot.start(config))
 
     return {"message": "Bot started", "mode": config.trade_mode.value}
 
@@ -98,11 +97,6 @@ async def stop_bot(
     config.status = BotStatus.STOPPED
     await db.commit()
 
-    bot = _bot_registry.get(user.id)
-    if bot:
-        await bot.stop()
-        del _bot_registry[user.id]
-
     return {"message": "Bot stopped"}
 
 
@@ -113,13 +107,11 @@ async def pause_bot(
 ):
     result = await db.execute(select(BotConfig).where(BotConfig.user_id == user.id))
     config = result.scalar_one_or_none()
+    if not config:
+        raise HTTPException(status_code=404, detail="Bot config not found")
 
     config.status = BotStatus.PAUSED
     await db.commit()
-
-    bot = _bot_registry.get(user.id)
-    if bot:
-        await bot.pause()
 
     return {"message": "Bot paused"}
 
@@ -151,13 +143,16 @@ async def set_trade_mode(
 ):
     result = await db.execute(select(BotConfig).where(BotConfig.user_id == user.id))
     config = result.scalar_one_or_none()
+    if not config:
+        raise HTTPException(status_code=404, detail="Not found")
 
-    if body.mode == TradeMode.LIVE and config.status == BotStatus.RUNNING:
-        raise HTTPException(status_code=400, detail="Stop bot before switching to live mode")
+    try:
+        config.trade_mode = TradeMode(body.mode)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid mode: {body.mode}")
 
-    config.trade_mode = body.mode
     await db.commit()
-    return {"message": f"Mode set to {body.mode.value}"}
+    return {"message": f"Mode set to {body.mode}"}
 
 
 @router.get("/health-logs")
@@ -173,7 +168,16 @@ async def get_health_logs(
         .limit(limit)
     )
     logs = result.scalars().all()
-    return [{"status": l.status, "message": l.message, "open_positions": l.open_positions, "daily_pnl": l.daily_pnl, "checked_at": l.checked_at} for l in logs]
+    return [
+        {
+            "status": l.status,
+            "message": l.message,
+            "open_positions": l.open_positions,
+            "daily_pnl": l.daily_pnl,
+            "checked_at": l.checked_at.isoformat() if l.checked_at else None,
+        }
+        for l in logs
+    ]
 
 
 @router.post("/reset-daily")
@@ -183,6 +187,9 @@ async def reset_daily_stats(
 ):
     result = await db.execute(select(BotConfig).where(BotConfig.user_id == user.id))
     config = result.scalar_one_or_none()
+    if not config:
+        raise HTTPException(status_code=404, detail="Not found")
+
     config.daily_loss = 0.0
     config.daily_trades = 0
     config.daily_reset_at = datetime.utcnow()
