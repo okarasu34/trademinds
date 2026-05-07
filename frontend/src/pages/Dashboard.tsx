@@ -638,7 +638,7 @@ function StrategiesPanel() {
   const toggle = async (id: string) => {
     const { strategiesApi } = await import("../utils/api");
     const r = await strategiesApi.toggle(id);
-    setStrategies(prev => prev.map(s => s.id === id ? { ...s, is_active: r.data.is_active } : s));
+   setStrategies(prev => prev.map(s => s.id === id ? { ...s, is_active: true } : { ...s, is_active: false }));
   };
 
   if (loading) return <div style={{ padding: 40, textAlign: "center", color: "#64748b" }}>Loading...</div>;
