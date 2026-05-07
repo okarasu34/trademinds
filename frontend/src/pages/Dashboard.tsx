@@ -281,7 +281,7 @@ export default function Dashboard() {
                 { label: "Open Positions", value: `${s.positions.open_count} / ${s.bot.max_positions}`, color: C.accent },
                 { label: "Unrealized P&L", value: `${s.positions.unrealized_pnl >= 0 ? "+" : ""}${s.positions.unrealized_pnl.toFixed(2)}`, color: s.positions.unrealized_pnl >= 0 ? C.green : C.red },
                 { label: "Today P&L", value: `${s.today.pnl >= 0 ? "+" : ""}${s.today.pnl.toFixed(2)}`, color: s.today.pnl >= 0 ? C.green : C.red },
-                { label: "All-Time P&L", value: `${s.all_time.pnl >= 0 ? "+" : ""}${s.all_time.pnl.toFixed(2)}`, color: s.all_time.pnl >= 0 ? C.green : C.red },
+                { label: "Balance", value: `${s.account.balance.toFixed(2)}`, color: C.green },
                 { label: "Win Rate", value: `${s.all_time.win_rate.toFixed(1)}%`, color: s.all_time.win_rate >= 50 ? C.green : C.red },
               ].map((k, i) => (
                 <div key={i} style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 10, padding: 16 }}>
