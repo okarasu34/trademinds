@@ -14,63 +14,53 @@ router = APIRouter()
 
 BUILTIN_STRATEGIES = [
     {
-        "name": "Trend Following",
-        "description": "Follows EMA crossovers and ADX trend strength. Enters on pullbacks in the direction of the primary trend. Best for trending forex and index markets.",
+        "name": "Alpha Trend",
+        "description": "Alpha Trend crossover + EMA hizalaması. Trend takip stratejisi. ATR + MFI tabanlı dinamik trend çizgisi ile EMA13/21 crossover kombinasyonu.",
         "strategy_type": StrategyType.TREND_FOLLOWING,
-        "markets": ["forex", "index", "stock"],
+        "markets": ["forex", "crypto", "commodity", "index"],
         "parameters": {
-            "ema_fast": 21, "ema_slow": 50, "ema_long": 200,
-            "adx_threshold": 25, "rsi_min": 40, "rsi_max": 70,
+            "atr_period": 13,
+            "mfi_period": 13,
+            "coeff": 1.1,
+            "ema_fast": 13,
+            "ema_slow": 21,
+            "ema_trend": 89,
+            "min_confidence": 0.6,
+        },
+        "is_builtin": True,
+        "priority": 1,
+    },
+    {
+        "name": "RSI Divergence",
+        "description": "RSI + MACD diverjans tespiti + Fibonacci seviyeleri. Dönüş stratejisi. En az 2 indikatörde aynı anda diverjans şartı.",
+        "strategy_type": StrategyType.MOMENTUM,
+        "markets": ["forex", "crypto", "commodity", "index"],
+        "parameters": {
+            "rsi_length": 13,
+            "macd_fast": 13,
+            "macd_slow": 21,
+            "macd_signal": 8,
+            "fibo_period": 144,
+            "min_divergence_count": 2,
+            "min_confidence": 0.65,
+        },
+        "is_builtin": True,
+        "priority": 2,
+    },
+    {
+        "name": "Smart Money",
+        "description": "Order Block + FVG + POC. Kurumsal trader mantığı. Fiyat order block içinde ve POC yakınındayken işlem açar.",
+        "strategy_type": StrategyType.CUSTOM,
+        "markets": ["forex", "crypto", "commodity", "index"],
+        "parameters": {
+            "ob_period": 8,
+            "fvg_atr_mult": 0.5,
+            "poc_period": 89,
+            "poc_proximity_pct": 0.5,
             "min_confidence": 0.70,
         },
         "is_builtin": True,
-    },
-    {
-        "name": "Momentum",
-        "description": "Captures strong momentum moves using RSI, MACD, and volume confirmation. High confidence threshold. Best for crypto and volatile assets.",
-        "strategy_type": StrategyType.MOMENTUM,
-        "markets": ["crypto", "stock"],
-        "parameters": {
-            "rsi_buy_threshold": 55, "rsi_sell_threshold": 45,
-            "macd_confirm": True, "volume_ratio_min": 1.5,
-            "min_confidence": 0.75,
-        },
-        "is_builtin": True,
-    },
-    {
-        "name": "Mean Reversion",
-        "description": "Trades overbought/oversold conditions using Bollinger Bands and Stochastic. Best in ranging, non-trending markets.",
-        "strategy_type": StrategyType.MEAN_REVERSION,
-        "markets": ["commodity", "forex"],
-        "parameters": {
-            "bb_position_buy": 0.15, "bb_position_sell": 0.85,
-            "rsi_oversold": 30, "rsi_overbought": 70,
-            "stoch_oversold": 20, "stoch_overbought": 80,
-            "min_confidence": 0.68,
-        },
-        "is_builtin": True,
-    },
-    {
-        "name": "Sentiment Analysis",
-        "description": "NLP-based news and social media sentiment analysis via Claude AI. Reads and interprets market narrative to trade in sentiment direction.",
-        "strategy_type": StrategyType.SENTIMENT,
-        "markets": ["forex", "crypto", "stock"],
-        "parameters": {
-            "sentiment_threshold": 0.6, "news_weight": 0.7,
-            "technical_weight": 0.3, "min_confidence": 0.72,
-        },
-        "is_builtin": True,
-    },
-    {
-        "name": "News Based",
-        "description": "Trades economic data releases. Waits for MyFXBook high-impact event, then enters on post-release momentum. Strict risk management.",
-        "strategy_type": StrategyType.NEWS_BASED,
-        "markets": ["forex", "commodity"],
-        "parameters": {
-            "entry_delay_seconds": 30, "max_spread_pips": 5,
-            "impact_filter": ["high"], "min_confidence": 0.73,
-        },
-        "is_builtin": True,
+        "priority": 3,
     },
 ]
 
@@ -110,11 +100,14 @@ async def list_strategies(
     result = await db.execute(
         select(Strategy).where(Strategy.user_id == user.id, Strategy.is_builtin == True)
     )
-    if not result.scalars().all():
+    existing = result.scalars().all()
+    if not existing:
         await _seed_builtin_strategies(user.id, db)
 
     result = await db.execute(
-        select(Strategy).where(Strategy.user_id == user.id).order_by(Strategy.priority.desc(), Strategy.created_at)
+        select(Strategy)
+        .where(Strategy.user_id == user.id)
+        .order_by(Strategy.priority, Strategy.created_at)
     )
     strategies = result.scalars().all()
     return [_serialize(s) for s in strategies]
@@ -176,7 +169,7 @@ async def delete_strategy(
 ):
     s = await _get_or_404(strategy_id, user.id, db)
     if s.is_builtin:
-        raise HTTPException(status_code=400, detail="Cannot delete built-in strategies. Disable them instead.")
+        raise HTTPException(status_code=400, detail="Cannot delete built-in strategies.")
     await db.delete(s)
     await db.commit()
 
@@ -187,17 +180,38 @@ async def toggle_strategy(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    """Bir strateji aktif edilince diğerleri otomatik pasif olur.
+    Zaten aktif olan strateji tekrar tıklanırsa değişmez."""
+
     s = await _get_or_404(strategy_id, user.id, db)
-    s.is_active = not s.is_active
+
+    # Zaten aktifse dokunma
+    if s.is_active:
+        return {"is_active": True, "message": f"{s.name} already active"}
+
+    # Tüm stratejileri pasif yap
+    all_result = await db.execute(
+        select(Strategy).where(Strategy.user_id == user.id)
+    )
+    all_strategies = all_result.scalars().all()
+    for strategy in all_strategies:
+        strategy.is_active = False
+
+    # Bu stratejiyi aktif et
+    s.is_active = True
     await db.commit()
-    return {"is_active": s.is_active}
+
+    return {"is_active": True, "message": f"{s.name} activated"}
 
 
 # ─── Helpers ───
 
 async def _get_or_404(strategy_id: str, user_id: str, db: AsyncSession) -> Strategy:
     result = await db.execute(
-        select(Strategy).where(Strategy.id == strategy_id, Strategy.user_id == user_id)
+        select(Strategy).where(
+            Strategy.id == strategy_id,
+            Strategy.user_id == user_id,
+        )
     )
     s = result.scalar_one_or_none()
     if not s:
