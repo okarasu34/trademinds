@@ -197,7 +197,7 @@ def setup_scheduler():
 
     scheduler.add_job(
         balance_sync_job,
-        IntervalTrigger(minutes=5),
+        IntervalTrigger(minutes=5, start_date="2000-01-01 00:01:00"),
         id="balance_sync",
         replace_existing=True,
         max_instances=1,
@@ -206,7 +206,7 @@ def setup_scheduler():
 
     scheduler.add_job(
         trade_sync_job,
-        IntervalTrigger(minutes=5),
+        IntervalTrigger(minutes=5, start_date="2000-01-01 00:02:00"),
         id="trade_sync",
         replace_existing=True,
         max_instances=1,
