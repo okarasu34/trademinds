@@ -8,6 +8,8 @@ Stratejiler DB'den çekilir, aktif olan kullanılır:
 
 Pipeline:
   Strategy Engine → Signal Validator → Position Guard → Risk Manager → Order Executor
+
+Fix: Redis-based ordered symbol cache — aynı sembol 1 saat içinde tekrar açılmaz.
 """
 import asyncio
 import hashlib
@@ -75,15 +77,8 @@ class AlphaTrendStrategy:
     """
     Strateji 1: Alpha Trend + EMA Hizalaması
 
-    BUY koşulları (ikisi birden):
-      - Alpha Trend yukarı döndü (cross_up)
-      - EMA13 > EMA21 (kısa vade yukarı)
-      - Fiyat EMA89 üzerinde (orta vade trend yukarı)
-
-    SELL koşulları (ikisi birden):
-      - Alpha Trend aşağı döndü (cross_down)
-      - EMA13 < EMA21 (kısa vade aşağı)
-      - Fiyat EMA89 altında (orta vade trend aşağı)
+    BUY: Alpha Trend yukarı döndü + EMA13 > EMA21 + fiyat EMA89 üzerinde
+    SELL: Alpha Trend aşağı döndü + EMA13 < EMA21 + fiyat EMA89 altında
     """
 
     @staticmethod
@@ -95,7 +90,6 @@ class AlphaTrendStrategy:
         rsi           = ind.get("rsi_13", 50)
         macd_cross    = ind.get("macd13_crossover", "bearish")
 
-        # BUY
         if at_cross_up and ema13_gt_21 and ema13_gt_89:
             confidence = 0.65
             if macd_cross == "bullish":
@@ -108,7 +102,6 @@ class AlphaTrendStrategy:
                 f"AlphaTrend cross UP | EMA13>{ind.get('ema_13','?')} > EMA21 | RSI={rsi:.1f}"
             )
 
-        # SELL
         if at_cross_down and not ema13_gt_21 and not ema13_gt_89:
             confidence = 0.65
             if macd_cross == "bearish":
@@ -128,33 +121,25 @@ class RSIDivergenceStrategy:
     """
     Strateji 2: RSI + MACD Diverjans + Fibonacci
 
-    BUY koşulları:
-      - RSI bullish diverjans VE MACD bullish diverjans (en az 1 tanesi)
-      - MACD histogram yukarı crossover
-      - Fiyat Fibonacci %38.2 veya %61.8 desteğine yakın
-
-    SELL koşulları:
-      - RSI bearish diverjans VE MACD bearish diverjans (en az 1 tanesi)
-      - MACD histogram aşağı crossover
-      - Fiyat Fibonacci %61.8 veya %78.6 direncine yakın
+    BUY: RSI/MACD bullish diverjans + MACD cross up + Fibonacci desteği
+    SELL: RSI/MACD bearish diverjans + MACD cross down + Fibonacci direnci
     """
 
     @staticmethod
     def generate(ind: dict, params: dict) -> Optional[tuple[OrderSide, float, str]]:
-        rsi_bull_div  = ind.get("rsi_bullish_divergence", False)
-        rsi_bear_div  = ind.get("rsi_bearish_divergence", False)
-        macd_bull_div = ind.get("macd_bullish_divergence", False)
-        macd_bear_div = ind.get("macd_bearish_divergence", False)
+        rsi_bull_div   = ind.get("rsi_bullish_divergence", False)
+        rsi_bear_div   = ind.get("rsi_bearish_divergence", False)
+        macd_bull_div  = ind.get("macd_bullish_divergence", False)
+        macd_bear_div  = ind.get("macd_bearish_divergence", False)
         macd_cross_up  = ind.get("macd13_cross_up", False)
         macd_cross_dn  = ind.get("macd13_cross_down", False)
         near_fibo      = ind.get("near_fibo_level")
         rsi            = ind.get("rsi_13", 50)
 
-        min_div = params.get("min_divergence_count", 2)
+        min_div        = params.get("min_divergence_count", 2)
         bull_div_count = sum([rsi_bull_div, macd_bull_div])
         bear_div_count = sum([rsi_bear_div, macd_bear_div])
 
-        # BUY — yeterli bullish diverjans + MACD cross up
         if bull_div_count >= min_div and macd_cross_up:
             confidence = 0.60 + bull_div_count * 0.10
             if near_fibo in ("fibo_382", "fibo_500", "fibo_618"):
@@ -167,7 +152,6 @@ class RSIDivergenceStrategy:
                 f"RSI+MACD bullish div ({bull_div_count}) | MACD cross up | Fibo={near_fibo} | RSI={rsi:.1f}"
             )
 
-        # SELL — yeterli bearish diverjans + MACD cross down
         if bear_div_count >= min_div and macd_cross_dn:
             confidence = 0.60 + bear_div_count * 0.10
             if near_fibo in ("fibo_618", "fibo_786", "fibo_1000"):
@@ -180,7 +164,6 @@ class RSIDivergenceStrategy:
                 f"RSI+MACD bearish div ({bear_div_count}) | MACD cross down | Fibo={near_fibo} | RSI={rsi:.1f}"
             )
 
-        # Sadece 1 diverjans + güçlü MACD + Fibonacci seviyesi (daha gevşek)
         if bull_div_count >= 1 and macd_cross_up and near_fibo in ("fibo_382", "fibo_618"):
             return (
                 OrderSide.BUY,
@@ -202,32 +185,22 @@ class SmartMoneyStrategy:
     """
     Strateji 3: Order Block + FVG + POC
 
-    BUY koşulları:
-      - Fiyat bullish order block içinde
-      - POC yakınında (%0.5 mesafe)
-      - Bullish FVG var (boşluk doldurma)
-      - MACD bullish
-
-    SELL koşulları:
-      - Fiyat bearish order block içinde
-      - POC yakınında
-      - Bearish FVG var
-      - MACD bearish
+    BUY: Fiyat bullish OB içinde + POC yakın + bullish FVG + MACD bullish
+    SELL: Fiyat bearish OB içinde + POC yakın + bearish FVG + MACD bearish
     """
 
     @staticmethod
     def generate(ind: dict, params: dict) -> Optional[tuple[OrderSide, float, str]]:
-        in_bull_ob   = ind.get("in_bullish_ob", False)
-        in_bear_ob   = ind.get("in_bearish_ob", False)
-        near_poc     = ind.get("near_poc", False)
-        bull_fvg     = ind.get("bull_fvg", False)
-        bear_fvg     = ind.get("bear_fvg", False)
-        macd_cross   = ind.get("macd13_crossover", "bearish")
-        poc_prox     = ind.get("poc_proximity_pct", 999)
-        rsi          = ind.get("rsi_13", 50)
+        in_bull_ob    = ind.get("in_bullish_ob", False)
+        in_bear_ob    = ind.get("in_bearish_ob", False)
+        near_poc      = ind.get("near_poc", False)
+        bull_fvg      = ind.get("bull_fvg", False)
+        bear_fvg      = ind.get("bear_fvg", False)
+        macd_cross    = ind.get("macd13_crossover", "bearish")
+        poc_prox      = ind.get("poc_proximity_pct", 999)
+        rsi           = ind.get("rsi_13", 50)
         poc_threshold = params.get("poc_proximity_pct", 0.5)
 
-        # BUY — bullish OB + POC yakın + bullish FVG
         if in_bull_ob and poc_prox <= poc_threshold:
             confidence = 0.65
             if bull_fvg:
@@ -242,7 +215,6 @@ class SmartMoneyStrategy:
                 f"Bullish OB + POC ({poc_prox:.2f}%) | FVG={bull_fvg} | MACD={macd_cross} | RSI={rsi:.1f}"
             )
 
-        # SELL — bearish OB + POC yakın + bearish FVG
         if in_bear_ob and poc_prox <= poc_threshold:
             confidence = 0.65
             if bear_fvg:
@@ -263,9 +235,9 @@ class SmartMoneyStrategy:
 # ─────────────────────── STRATEJİ FACTORY ───────────────────────
 
 STRATEGY_MAP = {
-    "Alpha Trend":      AlphaTrendStrategy,
-    "RSI Divergence":   RSIDivergenceStrategy,
-    "Smart Money":      SmartMoneyStrategy,
+    "Alpha Trend":    AlphaTrendStrategy,
+    "RSI Divergence": RSIDivergenceStrategy,
+    "Smart Money":    SmartMoneyStrategy,
 }
 
 
@@ -280,6 +252,29 @@ class SignalValidator:
             return False, f"Duplicate signal (key={signal.idempotency_key()})"
         await cache_set(key, {"processed_at": datetime.utcnow().isoformat()}, ttl=3600)
         return True, "OK"
+
+
+class OrderedSymbolCache:
+    """Başarılı emir açılan sembolleri Redis'te saklar.
+    Bir sonraki scan'de aynı sembol tekrar açılmaz (1 saat TTL)."""
+
+    @staticmethod
+    async def add(user_id: str, symbol: str, ttl: int = 3600):
+        key = f"ordered:{user_id}:{symbol}"
+        await cache_set(key, {"ordered_at": datetime.utcnow().isoformat()}, ttl=ttl)
+
+    @staticmethod
+    async def exists(user_id: str, symbol: str) -> bool:
+        key = f"ordered:{user_id}:{symbol}"
+        return await cache_get(key) is not None
+
+    @staticmethod
+    async def get_all_ordered(user_id: str, symbols: list) -> set:
+        ordered = set()
+        for symbol in symbols:
+            if await OrderedSymbolCache.exists(user_id, symbol):
+                ordered.add(symbol)
+        return ordered
 
 
 class PositionGuard:
@@ -365,10 +360,10 @@ class RiskManager:
 
         price = ask if signal.side == OrderSide.BUY else bid
 
-        market_key    = PositionGuard._infer_market(signal.symbol)
-        sl_pct        = MARKET_SL_PCT.get(market_key, 0.50) / 100.0
-        sl_distance   = price * sl_pct
-        tp_distance   = sl_distance * TP_RATIO
+        market_key  = PositionGuard._infer_market(signal.symbol)
+        sl_pct      = MARKET_SL_PCT.get(market_key, 0.50) / 100.0
+        sl_distance = price * sl_pct
+        tp_distance = sl_distance * TP_RATIO
 
         min_sl_distance = price * (min_stop_pct / 100.0)
         if sl_distance < min_sl_distance:
@@ -494,7 +489,6 @@ class TradingBot:
                 logger.info("<<< Bot scan finished")
 
     async def _scan_for_user(self, db: AsyncSession, config: BotConfig):
-        # Aktif broker
         br_result = await db.execute(
             select(BrokerAccount).where(
                 BrokerAccount.user_id == config.user_id,
@@ -510,7 +504,6 @@ class TradingBot:
         if not adapter:
             return
 
-        # Aktif strateji
         strategy = await self._get_active_strategy(db, config.user_id)
         if not strategy:
             logger.warning("No active strategy found")
@@ -528,13 +521,11 @@ class TradingBot:
             logger.warning("Watchlist empty, nothing to scan")
             return
 
-        # Günlük kayıp limiti
         ok, msg = await DailyLossGuard.check(config, db, broker, adapter)
         if not ok:
             logger.warning(f"Daily loss limit hit: {msg}")
             return
 
-        # Canlı pozisyonlar
         try:
             live_positions = await adapter.get_open_orders()
         except Exception as e:
@@ -549,6 +540,15 @@ class TradingBot:
         for p in live_positions:
             mk = PositionGuard._infer_market(p.symbol)
             ctx.market_counts[mk] = ctx.market_counts.get(mk, 0) + 1
+
+        # Redis cache'ten daha önce emir açılmış sembolleri çek
+        try:
+            redis_ordered = await OrderedSymbolCache.get_all_ordered(config.user_id, symbols)
+            ctx.open_symbols.update(redis_ordered)
+            if redis_ordered:
+                logger.info(f"Redis cache: {len(redis_ordered)} symbols blocked")
+        except Exception as e:
+            logger.warning(f"Redis cache read failed: {e}")
 
         logger.info(
             f"Scanning {len(symbols)} symbols | open={ctx.open_count} | "
@@ -576,7 +576,6 @@ class TradingBot:
         strategy: Strategy,
         strategy_class,
     ):
-        # Mum verisi çek
         try:
             df = await adapter.get_candles(symbol, "1h", limit=200)
         except Exception as e:
@@ -586,7 +585,6 @@ class TradingBot:
         if df is None or df.empty or len(df) < 50:
             return
 
-        # İndikatörleri hesapla
         try:
             ind = calculate_indicators(df)
         except Exception as e:
@@ -596,14 +594,12 @@ class TradingBot:
         if not ind:
             return
 
-        # Strateji sinyali üret
         result = strategy_class.generate(ind, strategy.parameters or {})
         if not result:
             return
 
         side, confidence, reasoning = result
 
-        # Market type
         inferred   = PositionGuard._infer_market(symbol)
         market_map = {
             "crypto":    MarketType.CRYPTO,
@@ -623,11 +619,11 @@ class TradingBot:
             confidence  = confidence,
             reasoning   = reasoning,
             indicators  = {
-                "rsi":          ind.get("rsi_13"),
-                "macd":         ind.get("macd13"),
-                "alpha_trend":  ind.get("alpha_trend"),
-                "ema_13":       ind.get("ema_13"),
-                "ema_21":       ind.get("ema_21"),
+                "rsi":         ind.get("rsi_13"),
+                "macd":        ind.get("macd13"),
+                "alpha_trend": ind.get("alpha_trend"),
+                "ema_13":      ind.get("ema_13"),
+                "ema_21":      ind.get("ema_21"),
             },
             timestamp   = datetime.utcnow(),
             strategy_id = strategy.id,
@@ -635,7 +631,6 @@ class TradingBot:
 
         logger.info(f"[{symbol}] [{strategy.name}] Signal: {side.value} conf={confidence:.2f} | {reasoning}")
 
-        # AI signal log
         log = AISignalLog(
             user_id     = signal.user_id,
             symbol      = signal.symbol,
@@ -677,6 +672,8 @@ class TradingBot:
         if ok:
             logger.success(f"[{symbol}] ORDER PLACED: {msg}")
             PositionGuard.register_open(signal, ctx)
+            # Redis cache'e ekle — bir sonraki scan'de bu sembol atlanır
+            await OrderedSymbolCache.add(signal.user_id, symbol, ttl=3600)
             log.acted_on = True
             log.trade_id = trade.id
             await db.commit()
