@@ -278,7 +278,7 @@ class SignalValidator:
         existing = await cache_get(key)
         if existing:
             return False, f"Duplicate signal (key={signal.idempotency_key()})"
-        await cache_set(key, {"processed_at": datetime.utcnow().isoformat()}, ttl=600)
+        await cache_set(key, {"processed_at": datetime.utcnow().isoformat()}, ttl=3600)
         return True, "OK"
 
 
