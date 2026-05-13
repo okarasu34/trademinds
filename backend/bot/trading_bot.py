@@ -140,7 +140,7 @@ class RSIDivergenceStrategy:
         bull_div_count = sum([rsi_bull_div, macd_bull_div])
         bear_div_count = sum([rsi_bear_div, macd_bear_div])
 
-        if bull_div_count >= min_div and macd_cross_up:
+        if bull_div_count >= min_div:
             confidence = 0.60 + bull_div_count * 0.10
             if near_fibo in ("fibo_382", "fibo_500", "fibo_618"):
                 confidence += 0.10
@@ -152,7 +152,7 @@ class RSIDivergenceStrategy:
                 f"RSI+MACD bullish div ({bull_div_count}) | MACD cross up | Fibo={near_fibo} | RSI={rsi:.1f}"
             )
 
-        if bear_div_count >= min_div and macd_cross_dn:
+        if bear_div_count >= min_div:
             confidence = 0.60 + bear_div_count * 0.10
             if near_fibo in ("fibo_618", "fibo_786", "fibo_1000"):
                 confidence += 0.10
@@ -164,14 +164,14 @@ class RSIDivergenceStrategy:
                 f"RSI+MACD bearish div ({bear_div_count}) | MACD cross down | Fibo={near_fibo} | RSI={rsi:.1f}"
             )
 
-        if bull_div_count >= 1 and macd_cross_up and near_fibo in ("fibo_382", "fibo_618"):
+        if bull_div_count >= 1 and near_fibo in ("fibo_382", "fibo_618"):
             return (
                 OrderSide.BUY,
                 0.65,
                 f"RSI/MACD bullish div + Fibo {near_fibo} destek | RSI={rsi:.1f}"
             )
 
-        if bear_div_count >= 1 and macd_cross_dn and near_fibo in ("fibo_618", "fibo_786"):
+        if bear_div_count >= 1 and near_fibo in ("fibo_618", "fibo_786"):
             return (
                 OrderSide.SELL,
                 0.65,
@@ -599,6 +599,18 @@ class TradingBot:
             return
 
         side, confidence, reasoning = result
+
+        # EMA200 trend filtresi — trend'e karşı pozisyon açma
+        ema200 = ind.get("ema_200")
+        current_price = ind.get("current_price")
+        if ema200 and current_price:
+            trend_up = current_price > ema200
+            if side == OrderSide.BUY and not trend_up:
+                logger.info(f"[{symbol}] REJECTED by EMA200: BUY ama trend ASAGI (price={current_price:.5f} < EMA200={ema200:.5f})")
+                return
+            if side == OrderSide.SELL and trend_up:
+                logger.info(f"[{symbol}] REJECTED by EMA200: SELL ama trend YUKARI (price={current_price:.5f} > EMA200={ema200:.5f})")
+                return
 
         inferred   = PositionGuard._infer_market(symbol)
         market_map = {
