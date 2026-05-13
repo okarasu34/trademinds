@@ -601,7 +601,7 @@ class TradingBot:
         side, confidence, reasoning = result
 
         # EMA200 trend filtresi — trend'e karşı pozisyon açma
-        ema200 = ind.get("ema_200")
+        ema200 = ind.get("ema_89") or ind.get("ema_200")
         current_price = ind.get("current_price")
         if ema200 and current_price:
             trend_up = current_price > ema200
