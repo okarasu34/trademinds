@@ -1,15 +1,16 @@
 """
 TradeMinds bot core — pipeline architecture + 3 strateji.
 
-Stratejiler DB'den çekilir, aktif olan kullanılır:
-  1. AlphaTrendStrategy   — Alpha Trend crossover + EMA hizalaması
-  2. RSIDivergenceStrategy — RSI + MACD diverjans + Fibonacci seviyeleri
-  3. SmartMoneyStrategy   — Order Block + FVG + POC
-
-Pipeline:
-  Strategy Engine → Signal Validator → Position Guard → Risk Manager → Order Executor
-
-Fix: Redis-based ordered symbol cache — aynı sembol 1 saat içinde tekrar açılmaz.
+Pipeline (her strateji için):
+  1. Sinyal üret (AlphaTrend / RSIDivergence / SmartMoney)
+  2. EMA200 + EMA50 trend filtresi
+  3. RSI aralık filtresi (35-65)
+  4. MACD teyidi
+  5. Signal Validator (idempotency)
+  6. Position Guard
+  7. Daily Loss Guard
+  8. Risk Manager (ATR bazlı SL/TP)
+  9. Order Executor
 """
 import asyncio
 import hashlib
@@ -31,16 +32,19 @@ from brokers.capital_adapter import CapitalAdapter
 from bot.indicators import calculate_indicators
 
 
-# ─────────────────────── SL/TP MESAFE TABLOSU ───────────────────────
+# ─────────────────────── SL/TP — ATR BAZLI ───────────────────────
 
+ATR_STOP_MULTIPLIER = 2.0   # SL = ATR × 2
+ATR_TP_MULTIPLIER   = 3.0   # TP = ATR × 3  → R/R = 1:1.5
+
+# Minimum SL mesafesi (piyasa tipine göre fallback)
 MARKET_SL_PCT = {
-    "forex":     0.30,
-    "crypto":    1.50,
-    "index":     0.50,
-    "commodity": 0.80,
-    "stock":     1.00,
+    "forex":     0.20,
+    "crypto":    1.00,
+    "index":     0.30,
+    "commodity": 0.50,
+    "stock":     0.70,
 }
-TP_RATIO = 2.0
 
 
 # ─────────────────────── DATA CLASSES ───────────────────────
@@ -74,12 +78,7 @@ class ScanContext:
 # ─────────────────────── STRATEJI SINIFLAR ───────────────────────
 
 class AlphaTrendStrategy:
-    """
-    Strateji 1: Alpha Trend + EMA Hizalaması
-
-    BUY: Alpha Trend yukarı döndü + EMA13 > EMA21 + fiyat EMA89 üzerinde
-    SELL: Alpha Trend aşağı döndü + EMA13 < EMA21 + fiyat EMA89 altında
-    """
+    """Alpha Trend crossover + EMA hizalaması."""
 
     @staticmethod
     def generate(ind: dict, params: dict) -> Optional[tuple[OrderSide, float, str]]:
@@ -118,12 +117,7 @@ class AlphaTrendStrategy:
 
 
 class RSIDivergenceStrategy:
-    """
-    Strateji 2: RSI + MACD Diverjans + Fibonacci
-
-    BUY: RSI/MACD bullish diverjans + MACD cross up + Fibonacci desteği
-    SELL: RSI/MACD bearish diverjans + MACD cross down + Fibonacci direnci
-    """
+    """RSI + MACD Diverjans + Fibonacci."""
 
     @staticmethod
     def generate(ind: dict, params: dict) -> Optional[tuple[OrderSide, float, str]]:
@@ -131,12 +125,10 @@ class RSIDivergenceStrategy:
         rsi_bear_div   = ind.get("rsi_bearish_divergence", False)
         macd_bull_div  = ind.get("macd_bullish_divergence", False)
         macd_bear_div  = ind.get("macd_bearish_divergence", False)
-        macd_cross_up  = ind.get("macd13_cross_up", False)
-        macd_cross_dn  = ind.get("macd13_cross_down", False)
         near_fibo      = ind.get("near_fibo_level")
         rsi            = ind.get("rsi_13", 50)
 
-        min_div        = params.get("min_divergence_count", 2)
+        min_div        = params.get("min_divergence_count", 1)
         bull_div_count = sum([rsi_bull_div, macd_bull_div])
         bear_div_count = sum([rsi_bear_div, macd_bear_div])
 
@@ -149,7 +141,7 @@ class RSIDivergenceStrategy:
             return (
                 OrderSide.BUY,
                 min(confidence, 0.95),
-                f"RSI+MACD bullish div ({bull_div_count}) | MACD cross up | Fibo={near_fibo} | RSI={rsi:.1f}"
+                f"RSI+MACD bullish div ({bull_div_count}) | Fibo={near_fibo} | RSI={rsi:.1f}"
             )
 
         if bear_div_count >= min_div:
@@ -161,33 +153,28 @@ class RSIDivergenceStrategy:
             return (
                 OrderSide.SELL,
                 min(confidence, 0.95),
-                f"RSI+MACD bearish div ({bear_div_count}) | MACD cross down | Fibo={near_fibo} | RSI={rsi:.1f}"
+                f"RSI+MACD bearish div ({bear_div_count}) | Fibo={near_fibo} | RSI={rsi:.1f}"
             )
 
         if bull_div_count >= 1 and near_fibo in ("fibo_382", "fibo_618"):
             return (
                 OrderSide.BUY,
                 0.65,
-                f"RSI/MACD bullish div + Fibo {near_fibo} destek | RSI={rsi:.1f}"
+                f"RSI/MACD bullish div + Fibo {near_fibo} | RSI={rsi:.1f}"
             )
 
         if bear_div_count >= 1 and near_fibo in ("fibo_618", "fibo_786"):
             return (
                 OrderSide.SELL,
                 0.65,
-                f"RSI/MACD bearish div + Fibo {near_fibo} direnç | RSI={rsi:.1f}"
+                f"RSI/MACD bearish div + Fibo {near_fibo} | RSI={rsi:.1f}"
             )
 
         return None
 
 
 class SmartMoneyStrategy:
-    """
-    Strateji 3: Order Block + FVG + POC
-
-    BUY: Fiyat bullish OB içinde + POC yakın + bullish FVG + MACD bullish
-    SELL: Fiyat bearish OB içinde + POC yakın + bearish FVG + MACD bearish
-    """
+    """Order Block + FVG + POC."""
 
     @staticmethod
     def generate(ind: dict, params: dict) -> Optional[tuple[OrderSide, float, str]]:
@@ -255,8 +242,7 @@ class SignalValidator:
 
 
 class OrderedSymbolCache:
-    """Başarılı emir açılan sembolleri Redis'te saklar.
-    Bir sonraki scan'de aynı sembol tekrar açılmaz (1 saat TTL)."""
+    """Başarılı emir açılan sembolleri Redis'te saklar."""
 
     @staticmethod
     async def add(user_id: str, symbol: str, ttl: int = 3600):
@@ -275,6 +261,83 @@ class OrderedSymbolCache:
             if await OrderedSymbolCache.exists(user_id, symbol):
                 ordered.add(symbol)
         return ordered
+
+
+class TrendFilter:
+    """EMA200 + EMA50 trend filtresi.
+    
+    BUY: fiyat > EMA89 VE EMA50 > EMA89
+    SELL: fiyat < EMA89 VE EMA50 < EMA89
+    """
+
+    @staticmethod
+    def check(signal: Signal, ind: dict) -> tuple[bool, str]:
+        ema_long  = ind.get("ema_89") or ind.get("ema_200")
+        ema_mid   = ind.get("ema_50")
+        price     = ind.get("current_price")
+
+        if not ema_long or not price:
+            return True, "OK"  # veri yoksa geç
+
+        trend_up = price > ema_long
+
+        # EMA50 filtresi (varsa ekstra güç)
+        if ema_mid:
+            ema_confirms = (ema_mid > ema_long) if trend_up else (ema_mid < ema_long)
+            if not ema_confirms:
+                return False, (
+                    f"EMA50 trend teyidi yok: "
+                    f"EMA50={ema_mid:.5f} {'<' if trend_up else '>'} EMA89={ema_long:.5f}"
+                )
+
+        if signal.side == OrderSide.BUY and not trend_up:
+            return False, f"REJECTED by Trend: BUY ama trend ASAGI (price={price:.5f} < EMA={ema_long:.5f})"
+        if signal.side == OrderSide.SELL and trend_up:
+            return False, f"REJECTED by Trend: SELL ama trend YUKARI (price={price:.5f} > EMA={ema_long:.5f})"
+
+        return True, "OK"
+
+
+class RSIFilter:
+    """RSI aralık filtresi.
+    
+    BUY: RSI 35-65 arası (aşırı alımda değil)
+    SELL: RSI 35-65 arası (aşırı satımda değil)
+    """
+
+    @staticmethod
+    def check(signal: Signal, ind: dict) -> tuple[bool, str]:
+        rsi = ind.get("rsi_14") or ind.get("rsi_13")
+        if not rsi:
+            return True, "OK"
+
+        if signal.side == OrderSide.BUY and rsi > 65:
+            return False, f"REJECTED by RSI: BUY ama RSI aşırı alım ({rsi:.1f} > 65)"
+        if signal.side == OrderSide.SELL and rsi < 35:
+            return False, f"REJECTED by RSI: SELL ama RSI aşırı satım ({rsi:.1f} < 35)"
+
+        return True, "OK"
+
+
+class MACDFilter:
+    """MACD teyidi filtresi.
+    
+    BUY: MACD histogram pozitif (yukarı momentum)
+    SELL: MACD histogram negatif (aşağı momentum)
+    """
+
+    @staticmethod
+    def check(signal: Signal, ind: dict) -> tuple[bool, str]:
+        hist = ind.get("macd13_histogram") or ind.get("macd_histogram")
+        if hist is None:
+            return True, "OK"
+
+        if signal.side == OrderSide.BUY and hist < 0:
+            return False, f"REJECTED by MACD: BUY ama histogram negatif ({hist:.5f})"
+        if signal.side == OrderSide.SELL and hist > 0:
+            return False, f"REJECTED by MACD: SELL ama histogram pozitif ({hist:.5f})"
+
+        return True, "OK"
 
 
 class PositionGuard:
@@ -343,8 +406,19 @@ class DailyLossGuard:
 
 
 class RiskManager:
+    """ATR bazlı SL/TP hesabı.
+    
+    SL = ATR × 2.0
+    TP = ATR × 3.0  → R/R = 1:1.5
+    """
+
     @staticmethod
-    async def calculate(signal: Signal, adapter: CapitalAdapter, config: BotConfig) -> tuple[bool, str, Optional[dict]]:
+    async def calculate(
+        signal: Signal,
+        adapter: CapitalAdapter,
+        config: BotConfig,
+        ind: dict,
+    ) -> tuple[bool, str, Optional[dict]]:
         try:
             rules = await adapter.get_market_rules(signal.symbol)
         except Exception as e:
@@ -360,15 +434,23 @@ class RiskManager:
 
         price = ask if signal.side == OrderSide.BUY else bid
 
-        market_key  = PositionGuard._infer_market(signal.symbol)
-        sl_pct      = MARKET_SL_PCT.get(market_key, 0.50) / 100.0
-        sl_distance = price * sl_pct
-        tp_distance = sl_distance * TP_RATIO
+        # ATR bazlı SL/TP
+        atr = ind.get("atr_14") or ind.get("atr_13")
+        if atr and atr > 0:
+            sl_distance = atr * ATR_STOP_MULTIPLIER
+            tp_distance = atr * ATR_TP_MULTIPLIER
+        else:
+            # ATR yoksa sabit % fallback
+            market_key  = PositionGuard._infer_market(signal.symbol)
+            sl_pct      = MARKET_SL_PCT.get(market_key, 0.30) / 100.0
+            sl_distance = price * sl_pct
+            tp_distance = sl_distance * 1.5
 
+        # Capital.com minimum stop distance kontrolü
         min_sl_distance = price * (min_stop_pct / 100.0)
         if sl_distance < min_sl_distance:
             sl_distance = min_sl_distance * 1.5
-            tp_distance = sl_distance * TP_RATIO
+            tp_distance = sl_distance * 1.5
 
         if signal.side == OrderSide.BUY:
             stop_loss   = round(price - sl_distance, 5)
@@ -377,6 +459,7 @@ class RiskManager:
             stop_loss   = round(price + sl_distance, 5)
             take_profit = round(price - tp_distance, 5)
 
+        # Lot size hesabı
         risk_pct = (config.max_risk_per_trade_pct or 1.0) / 100.0
         try:
             info    = await adapter.get_account_info()
@@ -386,12 +469,12 @@ class RiskManager:
 
         risk_amount    = balance * risk_pct
         calculated_lot = risk_amount / (sl_distance * 100) if sl_distance > 0 else float(min_size)
-        lot_size = max(float(min_size), min(round(calculated_lot, 2), float(min_size) * 50))
+        lot_size       = max(float(min_size), min(round(calculated_lot, 2), float(min_size) * 10))
 
         logger.info(
-            f"[{signal.symbol}] {market_key} | sl={sl_pct*100:.2f}% | "
-            f"risk={config.max_risk_per_trade_pct}% | lot={lot_size} | "
-            f"sl_price={stop_loss} tp_price={take_profit}"
+            f"[{signal.symbol}] ATR={atr:.5f} | "
+            f"sl={stop_loss} tp={take_profit} | "
+            f"risk={config.max_risk_per_trade_pct}% | lot={lot_size}"
         )
 
         return True, "OK", {
@@ -541,7 +624,6 @@ class TradingBot:
             mk = PositionGuard._infer_market(p.symbol)
             ctx.market_counts[mk] = ctx.market_counts.get(mk, 0) + 1
 
-        # Redis cache'ten daha önce emir açılmış sembolleri çek
         try:
             redis_ordered = await OrderedSymbolCache.get_all_ordered(config.user_id, symbols)
             ctx.open_symbols.update(redis_ordered)
@@ -594,24 +676,14 @@ class TradingBot:
         if not ind:
             return
 
+        # Strateji sinyali üret
         result = strategy_class.generate(ind, strategy.parameters or {})
         if not result:
             return
 
         side, confidence, reasoning = result
 
-        # EMA200 trend filtresi — trend'e karşı pozisyon açma
-        ema200 = ind.get("ema_89") or ind.get("ema_200")
-        current_price = ind.get("current_price")
-        if ema200 and current_price:
-            trend_up = current_price > ema200
-            if side == OrderSide.BUY and not trend_up:
-                logger.info(f"[{symbol}] REJECTED by EMA200: BUY ama trend ASAGI (price={current_price:.5f} < EMA200={ema200:.5f})")
-                return
-            if side == OrderSide.SELL and trend_up:
-                logger.info(f"[{symbol}] REJECTED by EMA200: SELL ama trend YUKARI (price={current_price:.5f} > EMA200={ema200:.5f})")
-                return
-
+        # Market type
         inferred   = PositionGuard._infer_market(symbol)
         market_map = {
             "crypto":    MarketType.CRYPTO,
@@ -636,6 +708,7 @@ class TradingBot:
                 "alpha_trend": ind.get("alpha_trend"),
                 "ema_13":      ind.get("ema_13"),
                 "ema_21":      ind.get("ema_21"),
+                "atr":         ind.get("atr_14"),
             },
             timestamp   = datetime.utcnow(),
             strategy_id = strategy.id,
@@ -643,39 +716,45 @@ class TradingBot:
 
         logger.info(f"[{symbol}] [{strategy.name}] Signal: {side.value} conf={confidence:.2f} | {reasoning}")
 
-        log = AISignalLog(
-            user_id     = signal.user_id,
-            symbol      = signal.symbol,
-            market_type = signal.market_type,
-            signal      = signal.side.value,
-            confidence  = signal.confidence,
-            reasoning   = signal.reasoning,
-            indicators  = signal.indicators,
-            acted_on    = False,
-        )
-        db.add(log)
-        await db.commit()
-        await db.refresh(log)
+        # ── FILTRELER ──
 
-        # Gate 1: Validator
+        # 1. Trend filtresi (EMA200 + EMA50)
+        ok, msg = TrendFilter.check(signal, ind)
+        if not ok:
+            logger.info(f"[{symbol}] {msg}")
+            return
+
+        # 2. RSI filtresi (35-65 aralığı)
+        ok, msg = RSIFilter.check(signal, ind)
+        if not ok:
+            logger.info(f"[{symbol}] {msg}")
+            return
+
+        # 3. MACD histogram teyidi
+        ok, msg = MACDFilter.check(signal, ind)
+        if not ok:
+            logger.info(f"[{symbol}] {msg}")
+            return
+
+        # 4. Signal Validator (idempotency)
         ok, msg = await SignalValidator.validate(signal)
         if not ok:
             logger.info(f"[{symbol}] REJECTED at Validator: {msg}")
             return
 
-        # Gate 2: Position Guard
+        # 5. Position Guard
         ok, msg = PositionGuard.check(signal, ctx, config)
         if not ok:
             logger.info(f"[{symbol}] REJECTED at PositionGuard: {msg}")
             return
 
-        # Gate 3: Risk Manager
-        ok, msg, risk_params = await RiskManager.calculate(signal, adapter, config)
+        # 6. Risk Manager (ATR bazlı)
+        ok, msg, risk_params = await RiskManager.calculate(signal, adapter, config, ind)
         if not ok:
             logger.info(f"[{symbol}] REJECTED at RiskManager: {msg}")
             return
 
-        # Gate 4: Order Executor
+        # 7. Order Executor
         if config.trade_mode != TradeMode.LIVE:
             logger.info(f"[{symbol}] PAPER mode — order not sent")
             return
@@ -684,10 +763,19 @@ class TradingBot:
         if ok:
             logger.success(f"[{symbol}] ORDER PLACED: {msg}")
             PositionGuard.register_open(signal, ctx)
-            # Redis cache'e ekle — bir sonraki scan'de bu sembol atlanır
             await OrderedSymbolCache.add(signal.user_id, symbol, ttl=3600)
-            log.acted_on = True
-            log.trade_id = trade.id
+            log = AISignalLog(
+                user_id     = signal.user_id,
+                symbol      = signal.symbol,
+                market_type = signal.market_type,
+                signal      = signal.side.value,
+                confidence  = signal.confidence,
+                reasoning   = signal.reasoning,
+                indicators  = signal.indicators,
+                acted_on    = True,
+                trade_id    = trade.id,
+            )
+            db.add(log)
             await db.commit()
         else:
             logger.error(f"[{symbol}] ORDER FAILED: {msg}")
