@@ -469,7 +469,7 @@ class RiskManager:
 
         risk_amount    = balance * risk_pct
         calculated_lot = risk_amount / (sl_distance * 100) if sl_distance > 0 else float(min_size)
-        lot_size       = max(float(min_size), min(round(calculated_lot, 2), float(min_size) * 10))
+        lot_size = max(float(min_size), min(round(calculated_lot, 2), float(min_size) * 10, 100.0))
 
         logger.info(
             f"[{signal.symbol}] ATR={atr:.5f} | "
