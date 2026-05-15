@@ -6,11 +6,13 @@ Pipeline (her strateji için):
   2. EMA200 + EMA50 trend filtresi
   3. RSI aralık filtresi (35-65)
   4. MACD teyidi
-  5. Signal Validator (idempotency)
-  6. Position Guard
-  7. Daily Loss Guard
-  8. Risk Manager (ATR bazlı SL/TP)
-  9. Order Executor
+  5. ★ News Guard (high-impact haber varsa sembolü atla)
+  6. ★ News Sentiment Boost (actual vs forecast → confidence ayarla)
+  7. Signal Validator (idempotency)
+  8. Position Guard
+  9. ★ Margin Guard (toplam margin %10'u geçerse dur)
+  10. Risk Manager (ATR bazlı SL/TP)
+  11. Order Executor
 """
 import asyncio
 import hashlib
@@ -30,7 +32,13 @@ from db.models import (
 from db.redis_client import cache_set, cache_get
 from brokers.capital_adapter import CapitalAdapter
 from bot.indicators import calculate_indicators
+from data.calendar import calendar_client
+from core.config import settings
 
+
+# ─────────────────────── MARGIN LIMIT ───────────────────────
+
+MAX_MARGIN_PCT = settings.BOT_MAX_MARGIN_PCT  # Default %10, .env ile değiştirilebilir
 
 # ─────────────────────── SL/TP — ATR BAZLI ───────────────────────
 
@@ -340,6 +348,270 @@ class MACDFilter:
         return True, "OK"
 
 
+# ─────────────────────── ★ NEWS GUARD ───────────────────────
+
+class NewsGuard:
+    """High-impact haber filtresi.
+    
+    MyFXBook takviminden sembolün para birimini etkileyen
+    yaklaşan high-impact eventleri kontrol eder.
+    BOT_NEWS_PAUSE_MINUTES içinde high-impact event varsa
+    o sembolü atlar.
+    
+    Örnek: EURUSD taranırken 15dk sonra ECB faiz kararı varsa → SKIP
+    """
+
+    # Sembolden para birimlerini çıkar
+    SYMBOL_CURRENCIES = {
+        "EURUSD": ["EUR", "USD"], "GBPUSD": ["GBP", "USD"], "USDJPY": ["USD", "JPY"],
+        "USDCHF": ["USD", "CHF"], "USDCAD": ["USD", "CAD"], "AUDUSD": ["AUD", "USD"],
+        "NZDUSD": ["NZD", "USD"], "EURGBP": ["EUR", "GBP"], "EURJPY": ["EUR", "JPY"],
+        "GBPJPY": ["GBP", "JPY"], "EURCHF": ["EUR", "CHF"], "EURAUD": ["EUR", "AUD"],
+        "EURCAD": ["EUR", "CAD"], "GBPCHF": ["GBP", "CHF"], "GBPAUD": ["GBP", "AUD"],
+        "GBPCAD": ["GBP", "CAD"], "AUDJPY": ["AUD", "JPY"], "AUDCAD": ["AUD", "CAD"],
+        "AUDNZD": ["AUD", "NZD"], "CADJPY": ["CAD", "JPY"], "NZDJPY": ["NZD", "JPY"],
+        "CHFJPY": ["CHF", "JPY"], "USDCNH": ["USD", "CNY"],
+    }
+
+    # Emtia/endeks para birimi eşleşmesi
+    COMMODITY_CURRENCIES = {
+        "GOLD": ["USD"], "XAUUSD": ["USD"], "SILVER": ["USD"], "XAGUSD": ["USD"],
+        "OIL": ["USD"], "BRENT": ["USD"], "NATURALGAS": ["USD"],
+        "US500": ["USD"], "US30": ["USD"], "NAS100": ["USD"], "US100": ["USD"],
+        "DE40": ["EUR"], "UK100": ["GBP"],
+    }
+
+    @staticmethod
+    def _get_currencies(symbol: str) -> list[str]:
+        """Sembolden etkilenen para birimlerini döndür."""
+        s = symbol.upper()
+        
+        # Direkt eşleşme
+        if s in NewsGuard.SYMBOL_CURRENCIES:
+            return NewsGuard.SYMBOL_CURRENCIES[s]
+        if s in NewsGuard.COMMODITY_CURRENCIES:
+            return NewsGuard.COMMODITY_CURRENCIES[s]
+        
+        # 6 harfli forex çifti tahmini (XXXYYY)
+        if len(s) == 6 and s.isalpha():
+            return [s[:3], s[3:]]
+        
+        # Kripto → USD bağımlı
+        if any(c in s for c in ("BTC", "ETH", "XRP", "SOL", "DOGE", "ADA")):
+            return ["USD"]
+        
+        return []
+
+    @staticmethod
+    async def check(symbol: str, pause_minutes: int = None) -> tuple[bool, str, list]:
+        """
+        High-impact haber kontrolü.
+        
+        Returns:
+            (ok, message, events)
+            ok=False → sembol atlanmalı
+            events → bulunan eventler (boost için de kullanılabilir)
+        """
+        if pause_minutes is None:
+            pause_minutes = settings.BOT_NEWS_PAUSE_MINUTES or 30
+
+        currencies = NewsGuard._get_currencies(symbol)
+        if not currencies:
+            return True, "OK", []
+
+        try:
+            # Takvimden yaklaşan eventleri çek
+            events = await calendar_client.get_calendar(
+                hours_ahead=2,
+                impact_filter=["high"],
+            )
+        except Exception as e:
+            logger.warning(f"[{symbol}] NewsGuard: Calendar fetch failed: {e}")
+            return True, "OK (calendar unavailable)", []  # hata varsa geç, bloklamak istemiyoruz
+
+        # Bu sembolün para birimlerini etkileyen eventleri filtrele
+        relevant = []
+        for event in events:
+            if event.get("currency") in currencies:
+                mins = event.get("minutes_until", 999)
+                if 0 <= mins <= pause_minutes:
+                    relevant.append(event)
+
+        if relevant:
+            event_names = ", ".join(
+                f"{e['title']} ({e['currency']}, {int(e['minutes_until'])}dk)"
+                for e in relevant[:3]
+            )
+            return False, f"News Guard: {event_names}", relevant
+
+        return True, "OK", events
+
+
+# ─────────────────────── ★ NEWS SENTIMENT BOOST ───────────────────────
+
+class NewsSentimentBoost:
+    """Haber sentiment'ına göre confidence ayarla.
+    
+    Yaklaşan medium/high impact haberlerin actual vs forecast
+    karşılaştırmasını yapar:
+    
+    - actual > forecast + sinyal aynı yön → confidence +0.05 ~ +0.10
+    - actual < forecast + sinyal ters yön → confidence -0.05 ~ -0.10
+    - Henüz açıklanmamış ama yaklaşan medium event → confidence -0.03 (belirsizlik)
+    
+    Minimum confidence eşiği: 0.55 (altına düşerse sinyal iptal)
+    """
+
+    MIN_CONFIDENCE = 0.55  # Bu eşiğin altına düşerse sinyal iptal
+
+    # Para birimi → pozitif veri = o para birimini güçlendirir
+    # BUY EURUSD → EUR güçlenir → EUR verisi pozitif = iyi
+    # SELL EURUSD → USD güçlenir → USD verisi pozitif = iyi
+
+    @staticmethod
+    def _parse_number(val: str) -> Optional[float]:
+        """Haber verisindeki sayıyı parse et (%, K, M, B destekli)."""
+        if not val or val.strip() == "":
+            return None
+        clean = val.strip().replace(",", "").replace("%", "").replace(" ", "")
+        multiplier = 1.0
+        if clean.endswith("K"):
+            multiplier = 1_000
+            clean = clean[:-1]
+        elif clean.endswith("M"):
+            multiplier = 1_000_000
+            clean = clean[:-1]
+        elif clean.endswith("B"):
+            multiplier = 1_000_000_000
+            clean = clean[:-1]
+        try:
+            return float(clean) * multiplier
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _is_currency_base(symbol: str, currency: str) -> bool:
+        """Para birimi bu semboldeki 'base' (ilk) mi yoksa 'quote' (ikinci) mi?
+        
+        EURUSD → EUR = base, USD = quote
+        BUY EURUSD = EUR güçlenir
+        Eğer EUR verisi iyi → BUY'ı destekler
+        Eğer USD verisi iyi → SELL'i destekler
+        """
+        s = symbol.upper()
+        c = currency.upper()
+        
+        # Forex çifti
+        if len(s) == 6 and s.isalpha():
+            return s[:3] == c
+        
+        # Emtia/endeks → USD genelde quote
+        return False
+
+    @staticmethod
+    async def adjust(
+        symbol: str,
+        side: OrderSide,
+        confidence: float,
+    ) -> tuple[float, str]:
+        """
+        Confidence'ı haberlere göre ayarla.
+        
+        Returns:
+            (new_confidence, reason)
+        """
+        currencies = NewsGuard._get_currencies(symbol)
+        if not currencies:
+            return confidence, ""
+
+        try:
+            # Son 4 saatteki medium + high eventleri çek
+            events = await calendar_client.get_calendar(
+                hours_ahead=4,
+                impact_filter=["medium", "high"],
+            )
+        except Exception as e:
+            logger.warning(f"[{symbol}] NewsSentimentBoost: Calendar error: {e}")
+            return confidence, ""
+
+        # Bu sembolle ilgili eventleri filtrele
+        relevant = [
+            e for e in events
+            if e.get("currency") in currencies
+        ]
+
+        if not relevant:
+            return confidence, ""
+
+        adjustment = 0.0
+        reasons = []
+
+        for event in relevant:
+            actual_str   = event.get("actual", "")
+            forecast_str = event.get("forecast", "")
+            impact       = event.get("impact", "medium")
+            currency     = event.get("currency", "")
+            title        = event.get("title", "")
+            mins_until   = event.get("minutes_until", 0)
+
+            actual   = NewsSentimentBoost._parse_number(actual_str)
+            forecast = NewsSentimentBoost._parse_number(forecast_str)
+
+            # ── DURUM 1: Veri açıklanmış (actual var) ──
+            if actual is not None and forecast is not None and forecast != 0:
+                surprise_pct = (actual - forecast) / abs(forecast) * 100
+                is_base = NewsSentimentBoost._is_currency_base(symbol, currency)
+
+                # Pozitif sürpriz → o para birimi güçlenir
+                currency_bullish = surprise_pct > 2  # %2'den fazla sürpriz
+                currency_bearish = surprise_pct < -2
+
+                if currency_bullish:
+                    if (is_base and side == OrderSide.BUY) or (not is_base and side == OrderSide.SELL):
+                        # Sinyal ile uyumlu → boost
+                        boost = 0.07 if impact == "high" else 0.04
+                        adjustment += boost
+                        reasons.append(f"{title}: {currency} beat ({actual_str}>{forecast_str}) → +{boost:.2f}")
+                    else:
+                        # Sinyal ile ters → penalty
+                        penalty = -0.07 if impact == "high" else -0.04
+                        adjustment += penalty
+                        reasons.append(f"{title}: {currency} beat ({actual_str}>{forecast_str}) vs signal → {penalty:.2f}")
+
+                elif currency_bearish:
+                    if (is_base and side == OrderSide.SELL) or (not is_base and side == OrderSide.BUY):
+                        boost = 0.07 if impact == "high" else 0.04
+                        adjustment += boost
+                        reasons.append(f"{title}: {currency} miss ({actual_str}<{forecast_str}) → +{boost:.2f}")
+                    else:
+                        penalty = -0.07 if impact == "high" else -0.04
+                        adjustment += penalty
+                        reasons.append(f"{title}: {currency} miss ({actual_str}<{forecast_str}) vs signal → {penalty:.2f}")
+
+            # ── DURUM 2: Henüz açıklanmamış, yaklaşan event (belirsizlik) ──
+            elif actual is None and 0 < mins_until <= 120:
+                # Yaklaşan event belirsizlik yaratır → küçük penalty
+                penalty = -0.03 if impact == "high" else -0.01
+                adjustment += penalty
+                reasons.append(f"{title} ({currency}, {int(mins_until)}dk) pending → {penalty:.2f}")
+
+        if adjustment == 0:
+            return confidence, ""
+
+        # Adjustment'ı sınırla: max ±0.15
+        adjustment = max(-0.15, min(0.15, adjustment))
+        new_confidence = round(confidence + adjustment, 2)
+
+        reason_str = " | ".join(reasons)
+
+        if new_confidence < NewsSentimentBoost.MIN_CONFIDENCE:
+            reason_str = f"BELOW MIN ({new_confidence:.2f} < {NewsSentimentBoost.MIN_CONFIDENCE}) | {reason_str}"
+
+        return new_confidence, reason_str
+
+
+# ─────────────────────── POSITION / DAILY LOSS GUARDS ───────────────────────
+
 class PositionGuard:
     @staticmethod
     def check(signal: Signal, ctx: ScanContext, config: BotConfig) -> tuple[bool, str]:
@@ -402,6 +674,43 @@ class DailyLossGuard:
         max_loss  = balance * (config.max_daily_loss_pct / 100.0)
         if daily_pnl < 0 and abs(daily_pnl) >= max_loss:
             return False, f"Daily loss limit reached: {daily_pnl:.2f} / -{max_loss:.2f}"
+        return True, "OK"
+
+
+class MarginGuard:
+    """Toplam margin kullanım limiti.
+    
+    Mevcut margin / hesap değeri oranı MAX_MARGIN_PCT'yi geçerse
+    yeni pozisyon açılmaz.
+    
+    Örnek: Hesap €39,000, margin €3,500 → %8.97 → OK
+           Hesap €39,000, margin €4,100 → %10.5 → BLOCKED
+    """
+
+    @staticmethod
+    async def check(adapter: CapitalAdapter) -> tuple[bool, str]:
+        try:
+            info = await adapter.get_account_info()
+        except Exception as e:
+            return False, f"MarginGuard: Account info failed: {e}"
+
+        equity = info.equity or info.balance
+        if equity <= 0:
+            return False, "MarginGuard: Invalid equity"
+
+        margin_used = info.margin_used or 0
+        margin_pct  = (margin_used / equity) * 100
+
+        if margin_pct >= MAX_MARGIN_PCT:
+            return False, (
+                f"MarginGuard: Margin limit reached "
+                f"({margin_used:.2f}/{equity:.2f} = {margin_pct:.1f}% >= {MAX_MARGIN_PCT}%)"
+            )
+
+        logger.info(
+            f"MarginGuard: OK — margin {margin_used:.2f}/{equity:.2f} = {margin_pct:.1f}% "
+            f"(limit {MAX_MARGIN_PCT}%)"
+        )
         return True, "OK"
 
 
@@ -469,7 +778,7 @@ class RiskManager:
 
         risk_amount    = balance * risk_pct
         calculated_lot = risk_amount / (sl_distance * 100) if sl_distance > 0 else float(min_size)
-        lot_size = max(float(min_size), min(round(calculated_lot, 2), float(min_size) * 10, 100.0))
+        lot_size = max(float(min_size), min(round(calculated_lot, 2), 100.0))
 
         logger.info(
             f"[{signal.symbol}] ATR={atr:.5f} | "
@@ -736,25 +1045,56 @@ class TradingBot:
             logger.info(f"[{symbol}] {msg}")
             return
 
-        # 4. Signal Validator (idempotency)
+        # ★ 4. NEWS GUARD — High-impact haber filtresi
+        ok, msg, news_events = await NewsGuard.check(symbol)
+        if not ok:
+            logger.warning(f"[{symbol}] SKIPPED by {msg}")
+            return
+
+        # ★ 5. NEWS SENTIMENT BOOST — Confidence ayarlama
+        new_confidence, news_reason = await NewsSentimentBoost.adjust(
+            symbol, signal.side, signal.confidence
+        )
+        if news_reason:
+            old_conf = signal.confidence
+            signal.confidence = new_confidence
+            signal.reasoning += f" | News: {news_reason}"
+            logger.info(
+                f"[{symbol}] News Boost: conf {old_conf:.2f} → {new_confidence:.2f} | {news_reason}"
+            )
+            # Minimum confidence kontrolü
+            if new_confidence < NewsSentimentBoost.MIN_CONFIDENCE:
+                logger.warning(
+                    f"[{symbol}] REJECTED by News Boost: "
+                    f"conf {new_confidence:.2f} < min {NewsSentimentBoost.MIN_CONFIDENCE}"
+                )
+                return
+
+        # 6. Signal Validator (idempotency)
         ok, msg = await SignalValidator.validate(signal)
         if not ok:
             logger.info(f"[{symbol}] REJECTED at Validator: {msg}")
             return
 
-        # 5. Position Guard
+        # 7. Position Guard
         ok, msg = PositionGuard.check(signal, ctx, config)
         if not ok:
             logger.info(f"[{symbol}] REJECTED at PositionGuard: {msg}")
             return
 
-        # 6. Risk Manager (ATR bazlı)
+        # 8. ★ Margin Guard — toplam margin %10'u geçerse dur
+        ok, msg = await MarginGuard.check(adapter)
+        if not ok:
+            logger.warning(f"[{symbol}] REJECTED at {msg}")
+            return
+
+        # 9. Risk Manager (ATR bazlı)
         ok, msg, risk_params = await RiskManager.calculate(signal, adapter, config, ind)
         if not ok:
             logger.info(f"[{symbol}] REJECTED at RiskManager: {msg}")
             return
 
-        # 7. Order Executor
+        # 10. Order Executor
         if config.trade_mode != TradeMode.LIVE:
             logger.info(f"[{symbol}] PAPER mode — order not sent")
             return

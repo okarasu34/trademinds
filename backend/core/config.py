@@ -43,8 +43,9 @@ class Settings(BaseSettings):
     BOT_HEALTH_CHECK_INTERVAL: int = 60       # seconds
     BOT_MAX_POSITIONS: int = 25
     BOT_MAX_DAILY_LOSS_PCT: float = 5.0       # % of balance
-    BOT_MAX_RISK_PER_TRADE_PCT: float = 1.0   # % of balance
+    BOT_MAX_RISK_PER_TRADE_PCT: float = 2.0   # % of balance (was 1.0)
     BOT_NEWS_PAUSE_MINUTES: int = 30          # pause before high-impact news
+    BOT_MAX_MARGIN_PCT: float = 10.0          # max toplam margin % of equity
 
     # Currency
     BASE_CURRENCY: str = "USD"               # USD or EUR
