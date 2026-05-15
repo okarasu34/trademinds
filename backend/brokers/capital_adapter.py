@@ -114,7 +114,7 @@ class CapitalAdapter(BrokerAdapter):
                 return AccountInfo(
                     balance     = balance.get("balance", 0),
                     equity      = balance.get("balance", 0) + balance.get("profitLoss", 0),
-                    margin_used = balance.get("deposit", 0),
+                    margin_used = balance.get("balance", 0) - balance.get("available", 0),
                     free_margin = balance.get("available", 0),
                     currency    = balance.get("currency", "EUR"),
                 )
