@@ -400,7 +400,7 @@ class CapitalAdapter(BrokerAdapter):
 
                 data    = await resp.json()
                 markets = data.get("markets", [])
-                epics   = [m.get("epic") for m in markets if m.get("epic")]
+                epics   = [m.get("epic") for m in markets if m and m.get("epic")]
                 logger.info(f"Found {len(epics)} markets in watchlist {watchlist_id}")
                 return epics
 
