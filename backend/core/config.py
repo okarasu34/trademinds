@@ -34,7 +34,8 @@ class Settings(BaseSettings):
     ANTHROPIC_MODEL: str = "claude-sonnet-4-20250514"
     ANTHROPIC_MAX_TOKENS: int = 4096
 
-    # MyFXBook
+    # Finnhub (economic calendar)
+    FINNHUB_API_KEY: str = ""
 
     # Broker API Keys (encrypted in DB, these are master encryption keys)
     BROKER_ENCRYPTION_KEY: str = secrets.token_urlsafe(32)
