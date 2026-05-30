@@ -125,13 +125,12 @@ class AlphaTrendStrategy:
 
 
 class MultiDivergenceStrategy:
-    """10 İndikatör Multi-Divergence + Fibonacci.
+    """10 İndikatör Multi-Divergence + Tillson T3 + Sharpe Ratio + LinReg + RSI Midline.
     
-    MACD, Histogram, RSI, Stochastic, CCI, Momentum,
-    OBV, VWmacd, CMF, MFI üzerinde eş zamanlı diverjans taraması.
+    Pine Script v10 stratejisinin tam Python karşılığı.
     
-    Minimum 2 indikatörde diverjans → sinyal üret.
-    Daha fazla diverjans = daha yüksek confidence.
+    Sinyal: 10 indikatörde diverjans taraması
+    Filtreler: Tillson T3 trend, Sharpe Ratio, Linear Regression, RSI Midline
     """
 
     @staticmethod
@@ -144,11 +143,20 @@ class MultiDivergenceStrategy:
         rsi        = ind.get("rsi_13", 50)
         macd_cross = ind.get("macd13_crossover", "bearish")
 
+        # Yeni indikatörler
+        t3_rising      = ind.get("t3_rising")
+        above_t3       = ind.get("above_t3")
+        sharpe_status  = ind.get("sharpe_status", "neutral")
+        sharpe_ratio   = ind.get("sharpe_ratio", 0)
+        linreg_trend   = ind.get("linreg_trend", "neutral")
+        linreg_strong  = ind.get("linreg_strong", False)
+        linreg_pos     = ind.get("linreg_position", "inside")
+        above_midline  = ind.get("above_rsi_midline")
+
         min_div = params.get("min_divergence_count", 2)
 
         # ── Bullish Divergence ──
         if bull_count >= min_div:
-            # Base confidence: 0.55 + her diverjans için +0.05
             confidence = 0.55 + bull_count * 0.05
 
             # Fibonacci desteği
@@ -163,10 +171,34 @@ class MultiDivergenceStrategy:
             if macd_cross == "bullish":
                 confidence += 0.05
 
+            # Tillson T3 yükseliyor
+            if t3_rising is True:
+                confidence += 0.03
+
+            # RSI Midline altında (dip bölgesi)
+            if above_midline is False:
+                confidence += 0.03
+
+            # Linear Regression trend teyidi
+            if linreg_trend == "bullish" and linreg_strong:
+                confidence += 0.05
+            
+            # Linear Regression alt bandında
+            if linreg_pos == "below_lower":
+                confidence += 0.03
+
+            # Sharpe Ratio filtresi
+            if sharpe_status == "overvalued":
+                confidence -= 0.10  # aşırı değerli, BUY riskli
+            elif sharpe_status == "critical_undervalued":
+                confidence += 0.05  # çok düşük değerli, BUY fırsatı
+
             return (
                 OrderSide.BUY,
-                min(confidence, 0.95),
-                f"MultiDiv BULL ({bull_count}): {bull_names} | Fibo={near_fibo} | RSI={rsi:.1f}"
+                min(max(confidence, 0.40), 0.95),
+                f"MultiDiv BULL ({bull_count}): {bull_names} | Fibo={near_fibo} | "
+                f"RSI={rsi:.1f} | T3={'↑' if t3_rising else '↓'} | "
+                f"Sharpe={sharpe_ratio:.1f} | LinReg={linreg_trend}"
             )
 
         # ── Bearish Divergence ──
@@ -182,10 +214,34 @@ class MultiDivergenceStrategy:
             if macd_cross == "bearish":
                 confidence += 0.05
 
+            # Tillson T3 düşüyor
+            if t3_rising is False:
+                confidence += 0.03
+
+            # RSI Midline üstünde (tepe bölgesi)
+            if above_midline is True:
+                confidence += 0.03
+
+            # Linear Regression trend teyidi
+            if linreg_trend == "bearish" and linreg_strong:
+                confidence += 0.05
+
+            # Linear Regression üst bandında
+            if linreg_pos == "above_upper":
+                confidence += 0.03
+
+            # Sharpe Ratio filtresi
+            if sharpe_status == "critical_undervalued":
+                confidence -= 0.10  # çok düşük değerli, SELL riskli
+            elif sharpe_status == "overvalued":
+                confidence += 0.05  # aşırı değerli, SELL fırsatı
+
             return (
                 OrderSide.SELL,
-                min(confidence, 0.95),
-                f"MultiDiv BEAR ({bear_count}): {bear_names} | Fibo={near_fibo} | RSI={rsi:.1f}"
+                min(max(confidence, 0.40), 0.95),
+                f"MultiDiv BEAR ({bear_count}): {bear_names} | Fibo={near_fibo} | "
+                f"RSI={rsi:.1f} | T3={'↑' if t3_rising else '↓'} | "
+                f"Sharpe={sharpe_ratio:.1f} | LinReg={linreg_trend}"
             )
 
         return None

@@ -565,6 +565,154 @@ def calculate_indicators(df: pd.DataFrame) -> dict:
         else "neutral"
     )
 
+    # ─── RSI Midline (fiyat bazlı destek/direnç) ───
+    # Pine Script: RSI overbought/oversold seviyelerini fiyat üzerinde gösterir
+    ob_level = 70
+    os_level = 30
+    rsi_len  = 21
+    ep_rsi   = 2 * rsi_len - 1
+    rsi_src  = close
+    auc = rsi_src.diff().clip(lower=0).ewm(span=ep_rsi, adjust=False).mean()
+    adc = (-rsi_src.diff()).clip(lower=0).ewm(span=ep_rsi, adjust=False).mean()
+
+    x1 = (rsi_len - 1) * (adc * ob_level / (100 - ob_level) - auc)
+    ub_rsi = pd.Series(np.where(x1 >= 0, rsi_src + x1, rsi_src + x1 * (100 - ob_level) / ob_level), index=close.index)
+
+    x2 = (rsi_len - 1) * (adc * os_level / (100 - os_level) - auc)
+    lb_rsi = pd.Series(np.where(x2 >= 0, rsi_src + x2, rsi_src + x2 * (100 - os_level) / os_level), index=close.index)
+
+    rsi_midline = (ub_rsi + lb_rsi) / 2
+    indicators["rsi_midline"]    = round(rsi_midline.iloc[-1], 5) if not np.isnan(rsi_midline.iloc[-1]) else None
+    indicators["rsi_resistance"] = round(ub_rsi.iloc[-1], 5) if not np.isnan(ub_rsi.iloc[-1]) else None
+    indicators["rsi_support"]    = round(lb_rsi.iloc[-1], 5) if not np.isnan(lb_rsi.iloc[-1]) else None
+    indicators["above_rsi_midline"] = bool(current_close > rsi_midline.iloc[-1]) if not np.isnan(rsi_midline.iloc[-1]) else None
+
+    # ─── Tillson T3 ───
+    # Üçlü üstel yumuşatma — gürültüyü filtreler
+    t3_len = 8
+    t3_vf  = 0.7
+    t3_src = (high + low + open_ + close) / 4
+
+    t3_e1 = t3_src.ewm(span=t3_len, adjust=False).mean()
+    t3_e2 = t3_e1.ewm(span=t3_len, adjust=False).mean()
+    t3_e3 = t3_e2.ewm(span=t3_len, adjust=False).mean()
+    t3_e4 = t3_e3.ewm(span=t3_len, adjust=False).mean()
+    t3_e5 = t3_e4.ewm(span=t3_len, adjust=False).mean()
+    t3_e6 = t3_e5.ewm(span=t3_len, adjust=False).mean()
+
+    t3_c1 = -t3_vf ** 3
+    t3_c2 = 3 * t3_vf ** 2 + 3 * t3_vf ** 3
+    t3_c3 = -6 * t3_vf ** 2 - 3 * t3_vf - 3 * t3_vf ** 3
+    t3_c4 = 1 + 3 * t3_vf + t3_vf ** 3 + 3 * t3_vf ** 2
+
+    t3 = t3_c1 * t3_e6 + t3_c2 * t3_e5 + t3_c3 * t3_e4 + t3_c4 * t3_e3
+    indicators["tillson_t3"]       = round(t3.iloc[-1], 5) if not np.isnan(t3.iloc[-1]) else None
+    indicators["t3_rising"]        = bool(t3.iloc[-1] > t3.iloc[-2]) if len(t3) >= 2 and not np.isnan(t3.iloc[-2]) else None
+    indicators["above_t3"]         = bool(current_close > t3.iloc[-1]) if not np.isnan(t3.iloc[-1]) else None
+
+    # T3 Fibonacci (length=5, vf=0.618)
+    t3f_len = 5
+    t3f_vf  = 0.618
+    t3f_e1 = t3_src.ewm(span=t3f_len, adjust=False).mean()
+    t3f_e2 = t3f_e1.ewm(span=t3f_len, adjust=False).mean()
+    t3f_e3 = t3f_e2.ewm(span=t3f_len, adjust=False).mean()
+    t3f_e4 = t3f_e3.ewm(span=t3f_len, adjust=False).mean()
+    t3f_e5 = t3f_e4.ewm(span=t3f_len, adjust=False).mean()
+    t3f_e6 = t3f_e5.ewm(span=t3f_len, adjust=False).mean()
+
+    t3f_c1 = -t3f_vf ** 3
+    t3f_c2 = 3 * t3f_vf ** 2 + 3 * t3f_vf ** 3
+    t3f_c3 = -6 * t3f_vf ** 2 - 3 * t3f_vf - 3 * t3f_vf ** 3
+    t3f_c4 = 1 + 3 * t3f_vf + t3f_vf ** 3 + 3 * t3f_vf ** 2
+
+    t3_fibo = t3f_c1 * t3f_e6 + t3f_c2 * t3f_e5 + t3f_c3 * t3f_e4 + t3f_c4 * t3f_e3
+    indicators["tillson_t3_fibo"]  = round(t3_fibo.iloc[-1], 5) if not np.isnan(t3_fibo.iloc[-1]) else None
+    indicators["t3_fibo_rising"]   = bool(t3_fibo.iloc[-1] > t3_fibo.iloc[-2]) if len(t3_fibo) >= 2 and not np.isnan(t3_fibo.iloc[-2]) else None
+
+    # ─── Sharpe Ratio (180 periyot) ───
+    # Overvalued/Undervalued sınıflandırması
+    sharpe_lookback = min(180, len(df) - 1)
+    risk_free_rate  = 0.04  # yıllık
+    daily_return    = close.pct_change()
+
+    if sharpe_lookback >= 30:
+        mean_ret   = daily_return.tail(sharpe_lookback).mean()
+        std_ret    = daily_return.tail(sharpe_lookback).std() * np.sqrt(sharpe_lookback)
+        if std_ret and std_ret > 0:
+            sharpe = (mean_ret * 365 - risk_free_rate) / std_ret
+        else:
+            sharpe = 0.0
+
+        indicators["sharpe_ratio"]   = round(sharpe, 3)
+        indicators["sharpe_status"]  = (
+            "overvalued" if sharpe > 5.0
+            else "undervalued" if -3.0 < sharpe < -1.0
+            else "critical_undervalued" if sharpe <= -3.0
+            else "neutral"
+        )
+    else:
+        indicators["sharpe_ratio"]  = 0.0
+        indicators["sharpe_status"] = "neutral"
+
+    # ─── Linear Regression Channel (144 periyot) ───
+    linreg_len = min(144, len(df))
+    if linreg_len >= 30:
+        linreg_src = close.tail(linreg_len).values
+        x_vals     = np.arange(1, linreg_len + 1, dtype=float)
+
+        # Slope ve intercept hesapla
+        sum_x    = x_vals.sum()
+        sum_y    = linreg_src.sum()
+        sum_xy   = (x_vals * linreg_src).sum()
+        sum_x2   = (x_vals ** 2).sum()
+        n        = float(linreg_len)
+
+        slope     = (n * sum_xy - sum_x * sum_y) / (n * sum_x2 - sum_x ** 2)
+        avg_y     = sum_y / n
+        intercept = avg_y - slope * sum_x / n + slope
+
+        start_price = intercept + slope * (linreg_len - 1)
+        end_price   = intercept
+
+        # Standard deviation ve Pearson R
+        predicted = intercept + slope * np.arange(0, linreg_len, dtype=float)
+        residuals = linreg_src - predicted
+        std_dev   = np.std(residuals)
+
+        # Pearson R korelasyonu
+        mean_x = x_vals.mean()
+        mean_y = linreg_src.mean()
+        dsxx   = ((x_vals - mean_x) ** 2).sum()
+        dsyy   = ((predicted - predicted.mean()) ** 2).sum()
+        dsxy   = ((x_vals - mean_x) * (predicted - predicted.mean())).sum()
+        pearson_r = dsxy / np.sqrt(dsxx * dsyy) if dsxx > 0 and dsyy > 0 else 0.0
+
+        upper_band = end_price + 2 * std_dev
+        lower_band = end_price - 2 * std_dev
+
+        # Trend yönü: start > end ise yükseliş (slope negatif = fiyat yükseliyor)
+        linreg_trend = "bullish" if slope < 0 else "bearish"
+
+        indicators["linreg_slope"]      = round(slope, 8)
+        indicators["linreg_upper"]      = round(upper_band, 5)
+        indicators["linreg_lower"]      = round(lower_band, 5)
+        indicators["linreg_middle"]     = round(end_price, 5)
+        indicators["linreg_pearson_r"]  = round(abs(pearson_r), 4)
+        indicators["linreg_trend"]      = linreg_trend
+        indicators["linreg_strong"]     = bool(abs(pearson_r) > 0.8)
+        indicators["above_linreg"]      = bool(current_close > end_price)
+        indicators["linreg_position"]   = (
+            "above_upper" if current_close > upper_band
+            else "below_lower" if current_close < lower_band
+            else "inside"
+        )
+    else:
+        indicators["linreg_slope"]     = 0.0
+        indicators["linreg_pearson_r"] = 0.0
+        indicators["linreg_trend"]     = "neutral"
+        indicators["linreg_strong"]    = False
+        indicators["linreg_position"]  = "inside"
+
     return indicators
 
 
