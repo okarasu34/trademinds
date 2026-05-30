@@ -124,58 +124,68 @@ class AlphaTrendStrategy:
         return None
 
 
-class RSIDivergenceStrategy:
-    """RSI + MACD Diverjans + Fibonacci."""
+class MultiDivergenceStrategy:
+    """10 İndikatör Multi-Divergence + Fibonacci.
+    
+    MACD, Histogram, RSI, Stochastic, CCI, Momentum,
+    OBV, VWmacd, CMF, MFI üzerinde eş zamanlı diverjans taraması.
+    
+    Minimum 2 indikatörde diverjans → sinyal üret.
+    Daha fazla diverjans = daha yüksek confidence.
+    """
 
     @staticmethod
     def generate(ind: dict, params: dict) -> Optional[tuple[OrderSide, float, str]]:
-        rsi_bull_div   = ind.get("rsi_bullish_divergence", False)
-        rsi_bear_div   = ind.get("rsi_bearish_divergence", False)
-        macd_bull_div  = ind.get("macd_bullish_divergence", False)
-        macd_bear_div  = ind.get("macd_bearish_divergence", False)
-        near_fibo      = ind.get("near_fibo_level")
-        rsi            = ind.get("rsi_13", 50)
+        bull_count = ind.get("multi_div_bull_count", 0)
+        bear_count = ind.get("multi_div_bear_count", 0)
+        bull_names = ind.get("multi_div_bull_names", "")
+        bear_names = ind.get("multi_div_bear_names", "")
+        near_fibo  = ind.get("near_fibo_level")
+        rsi        = ind.get("rsi_13", 50)
+        macd_cross = ind.get("macd13_crossover", "bearish")
 
-        min_div        = params.get("min_divergence_count", 1)
-        bull_div_count = sum([rsi_bull_div, macd_bull_div])
-        bear_div_count = sum([rsi_bear_div, macd_bear_div])
+        min_div = params.get("min_divergence_count", 2)
 
-        if bull_div_count >= min_div:
-            confidence = 0.60 + bull_div_count * 0.10
+        # ── Bullish Divergence ──
+        if bull_count >= min_div:
+            # Base confidence: 0.55 + her diverjans için +0.05
+            confidence = 0.55 + bull_count * 0.05
+
+            # Fibonacci desteği
             if near_fibo in ("fibo_382", "fibo_500", "fibo_618"):
-                confidence += 0.10
-            if rsi < 45:
+                confidence += 0.08
+
+            # RSI oversold bölgesi
+            if rsi < 40:
                 confidence += 0.05
+            
+            # MACD crossover teyidi
+            if macd_cross == "bullish":
+                confidence += 0.05
+
             return (
                 OrderSide.BUY,
                 min(confidence, 0.95),
-                f"RSI+MACD bullish div ({bull_div_count}) | Fibo={near_fibo} | RSI={rsi:.1f}"
+                f"MultiDiv BULL ({bull_count}): {bull_names} | Fibo={near_fibo} | RSI={rsi:.1f}"
             )
 
-        if bear_div_count >= min_div:
-            confidence = 0.60 + bear_div_count * 0.10
+        # ── Bearish Divergence ──
+        if bear_count >= min_div:
+            confidence = 0.55 + bear_count * 0.05
+
             if near_fibo in ("fibo_618", "fibo_786", "fibo_1000"):
-                confidence += 0.10
-            if rsi > 55:
+                confidence += 0.08
+
+            if rsi > 60:
                 confidence += 0.05
+            
+            if macd_cross == "bearish":
+                confidence += 0.05
+
             return (
                 OrderSide.SELL,
                 min(confidence, 0.95),
-                f"RSI+MACD bearish div ({bear_div_count}) | Fibo={near_fibo} | RSI={rsi:.1f}"
-            )
-
-        if bull_div_count >= 1 and near_fibo in ("fibo_382", "fibo_618"):
-            return (
-                OrderSide.BUY,
-                0.65,
-                f"RSI/MACD bullish div + Fibo {near_fibo} | RSI={rsi:.1f}"
-            )
-
-        if bear_div_count >= 1 and near_fibo in ("fibo_618", "fibo_786"):
-            return (
-                OrderSide.SELL,
-                0.65,
-                f"RSI/MACD bearish div + Fibo {near_fibo} | RSI={rsi:.1f}"
+                f"MultiDiv BEAR ({bear_count}): {bear_names} | Fibo={near_fibo} | RSI={rsi:.1f}"
             )
 
         return None
@@ -230,9 +240,9 @@ class SmartMoneyStrategy:
 # ─────────────────────── STRATEJİ FACTORY ───────────────────────
 
 STRATEGY_MAP = {
-    "Alpha Trend":    AlphaTrendStrategy,
-    "RSI Divergence": RSIDivergenceStrategy,
-    "Smart Money":    SmartMoneyStrategy,
+    "Alpha Trend":      AlphaTrendStrategy,
+    "Multi Divergence": MultiDivergenceStrategy,
+    "Smart Money":      SmartMoneyStrategy,
 }
 
 

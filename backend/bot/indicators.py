@@ -3,6 +3,188 @@ import numpy as np
 from typing import Optional
 
 
+def _find_pivots(series: pd.Series, period: int) -> tuple[list, list]:
+    """Pivot high ve pivot low noktalarını bul."""
+    pivot_highs = []  # (index, value)
+    pivot_lows  = []  # (index, value)
+    
+    for i in range(period, len(series) - period):
+        # Pivot High: ortadaki bar her iki taraftakinden yüksek
+        is_ph = True
+        for j in range(1, period + 1):
+            if series.iloc[i] <= series.iloc[i - j] or series.iloc[i] <= series.iloc[i + j]:
+                is_ph = False
+                break
+        if is_ph:
+            pivot_highs.append((i, series.iloc[i]))
+        
+        # Pivot Low: ortadaki bar her iki taraftakinden düşük
+        is_pl = True
+        for j in range(1, period + 1):
+            if series.iloc[i] >= series.iloc[i - j] or series.iloc[i] >= series.iloc[i + j]:
+                is_pl = False
+                break
+        if is_pl:
+            pivot_lows.append((i, series.iloc[i]))
+    
+    return pivot_highs, pivot_lows
+
+
+def _check_divergence(
+    price: pd.Series,
+    indicator: pd.Series,
+    pivot_period: int,
+    max_bars: int,
+    max_pivots: int,
+    div_type: str = "regular",
+) -> bool:
+    """
+    Diverjans kontrolü.
+    
+    regular bullish: fiyat düşük dip, indikatör yüksek dip
+    regular bearish: fiyat yüksek zirve, indikatör düşük zirve
+    """
+    if len(price) < pivot_period * 2 + 5:
+        return False
+    
+    try:
+        if div_type == "regular":
+            # Bullish: pivot lows'da kontrol
+            _, price_lows = _find_pivots(price, pivot_period)
+            _, ind_lows   = _find_pivots(indicator, pivot_period)
+            
+            if len(price_lows) < 2 or len(ind_lows) < 2:
+                return False
+            
+            # Son pivot low
+            curr_price_idx, curr_price_val = price_lows[-1]
+            curr_ind_val = indicator.iloc[curr_price_idx] if curr_price_idx < len(indicator) else None
+            if curr_ind_val is None or np.isnan(curr_ind_val):
+                return False
+            
+            # Önceki pivot lows ile karşılaştır
+            for i in range(len(price_lows) - 2, max(len(price_lows) - max_pivots - 1, -1), -1):
+                prev_idx, prev_price_val = price_lows[i]
+                if curr_price_idx - prev_idx > max_bars:
+                    break
+                if curr_price_idx - prev_idx < 5:
+                    continue
+                
+                prev_ind_val = indicator.iloc[prev_idx] if prev_idx < len(indicator) else None
+                if prev_ind_val is None or np.isnan(prev_ind_val):
+                    continue
+                
+                # Bullish regular: fiyat düşük dip, indikatör yüksek dip
+                if curr_price_val < prev_price_val and curr_ind_val > prev_ind_val:
+                    return True
+            
+            return False
+        
+        elif div_type == "regular_bear":
+            # Bearish: pivot highs'da kontrol
+            price_highs, _ = _find_pivots(price, pivot_period)
+            ind_highs, _   = _find_pivots(indicator, pivot_period)
+            
+            if len(price_highs) < 2 or len(ind_highs) < 2:
+                return False
+            
+            curr_price_idx, curr_price_val = price_highs[-1]
+            curr_ind_val = indicator.iloc[curr_price_idx] if curr_price_idx < len(indicator) else None
+            if curr_ind_val is None or np.isnan(curr_ind_val):
+                return False
+            
+            for i in range(len(price_highs) - 2, max(len(price_highs) - max_pivots - 1, -1), -1):
+                prev_idx, prev_price_val = price_highs[i]
+                if curr_price_idx - prev_idx > max_bars:
+                    break
+                if curr_price_idx - prev_idx < 5:
+                    continue
+                
+                prev_ind_val = indicator.iloc[prev_idx] if prev_idx < len(indicator) else None
+                if prev_ind_val is None or np.isnan(prev_ind_val):
+                    continue
+                
+                # Bearish regular: fiyat yüksek zirve, indikatör düşük zirve
+                if curr_price_val > prev_price_val and curr_ind_val < prev_ind_val:
+                    return True
+            
+            return False
+    
+    except Exception:
+        return False
+    
+    return False
+
+
+def _detect_multi_divergence(
+    close: pd.Series,
+    high: pd.Series,
+    low: pd.Series,
+    rsi: pd.Series,
+    macd: pd.Series,
+    macd_hist: pd.Series,
+    stoch: pd.Series,
+    cci: pd.Series,
+    momentum: pd.Series,
+    obv: pd.Series,
+    vwmacd: pd.Series,
+    cmf: pd.Series,
+    mfi: pd.Series,
+    pivot_period: int = 8,
+    max_bars: int = 144,
+    max_pivots: int = 13,
+) -> dict:
+    """
+    10 indikatörde diverjans tespit et.
+    
+    TradingView Pine Script'teki mantığı Python'a çevrilmiş hali.
+    MACD, Histogram, RSI, Stochastic, CCI, Momentum, OBV, VWmacd, CMF, MFI
+    """
+    indicators_list = [
+        ("MACD",  macd),
+        ("Hist",  macd_hist),
+        ("RSI",   rsi),
+        ("Stoch", stoch),
+        ("CCI",   cci),
+        ("MOM",   momentum),
+        ("OBV",   obv),
+        ("VWMACD", vwmacd),
+        ("CMF",   cmf),
+        ("MFI",   mfi),
+    ]
+    
+    bull_divs = []
+    bear_divs = []
+    
+    for name, ind_series in indicators_list:
+        try:
+            if ind_series is None or len(ind_series) < pivot_period * 2 + 10:
+                continue
+            
+            # NaN kontrolü
+            clean = ind_series.dropna()
+            if len(clean) < pivot_period * 2 + 10:
+                continue
+            
+            # Bullish divergence (fiyat düşük dip, indikatör yüksek dip)
+            if _check_divergence(close, ind_series, pivot_period, max_bars, max_pivots, "regular"):
+                bull_divs.append(name)
+            
+            # Bearish divergence (fiyat yüksek zirve, indikatör düşük zirve)
+            if _check_divergence(close, ind_series, pivot_period, max_bars, max_pivots, "regular_bear"):
+                bear_divs.append(name)
+        
+        except Exception:
+            continue
+    
+    return {
+        "bull_count": len(bull_divs),
+        "bear_count": len(bear_divs),
+        "bull_names": ", ".join(bull_divs) if bull_divs else "",
+        "bear_names": ", ".join(bear_divs) if bear_divs else "",
+    }
+
+
 def calculate_indicators(df: pd.DataFrame) -> dict:
     """
     Calculate comprehensive technical indicators from OHLCV data.
@@ -188,9 +370,68 @@ def calculate_indicators(df: pd.DataFrame) -> dict:
                 indicators["near_fibo_level"] = name
                 break
 
-    # ─── RSI Diverjans (basit tespit) ───
-    # Son 8 bar içinde fiyat yeni dip ama RSI daha yüksek → bullish diverjans
-    # Son 8 bar içinde fiyat yeni zirve ama RSI daha düşük → bearish diverjans
+    # ─── Ek İndikatörler (Multi-Divergence için) ───
+
+    # Stochastic 13 (diverjans için ayrı — mevcut stoch 14 periyot)
+    low13_stoch  = low.rolling(13).min()
+    high13_stoch = high.rolling(13).max()
+    stoch13_k    = 100 * (close - low13_stoch) / (high13_stoch - low13_stoch).replace(0, np.nan)
+    stoch13      = stoch13_k.rolling(3).mean()
+    indicators["stoch_13"] = round(stoch13.iloc[-1], 2) if not np.isnan(stoch13.iloc[-1]) else 50
+
+    # CCI (Commodity Channel Index, 13 periyot)
+    tp_cci   = (high + low + close) / 3
+    sma_tp   = tp_cci.rolling(13).mean()
+    mad_tp   = tp_cci.rolling(13).apply(lambda x: np.abs(x - x.mean()).mean(), raw=True)
+    cci      = (tp_cci - sma_tp) / (0.015 * mad_tp.replace(0, np.nan))
+    indicators["cci_13"] = round(cci.iloc[-1], 2) if not np.isnan(cci.iloc[-1]) else 0
+
+    # Momentum (13 periyot)
+    momentum = close - close.shift(13)
+    indicators["momentum_13"] = round(momentum.iloc[-1], 5) if not np.isnan(momentum.iloc[-1]) else 0
+
+    # OBV (On Balance Volume)
+    obv = pd.Series(0.0, index=close.index)
+    for idx in range(1, len(close)):
+        if close.iloc[idx] > close.iloc[idx-1]:
+            obv.iloc[idx] = obv.iloc[idx-1] + volume.iloc[idx]
+        elif close.iloc[idx] < close.iloc[idx-1]:
+            obv.iloc[idx] = obv.iloc[idx-1] - volume.iloc[idx]
+        else:
+            obv.iloc[idx] = obv.iloc[idx-1]
+    indicators["obv"] = round(obv.iloc[-1], 2)
+
+    # VWmacd (Volume Weighted MACD)
+    def vwma(src, vol, period):
+        return (src * vol).rolling(period).sum() / vol.rolling(period).sum().replace(0, np.nan)
+    vwma_fast = vwma(close, volume, 13)
+    vwma_slow = vwma(close, volume, 21)
+    vwmacd    = vwma_fast - vwma_slow
+    indicators["vwmacd"] = round(vwmacd.iloc[-1], 5) if not np.isnan(vwmacd.iloc[-1]) else 0
+
+    # CMF (Chaikin Money Flow, 21 periyot)
+    cmf_m = ((close - low) - (high - close)) / (high - low).replace(0, np.nan)
+    cmf_v = cmf_m * volume
+    cmf   = cmf_v.rolling(21).sum() / volume.rolling(21).sum().replace(0, np.nan)
+    indicators["cmf_21"] = round(cmf.iloc[-1], 4) if not np.isnan(cmf.iloc[-1]) else 0
+
+    # ─── Multi-Indicator Divergence (10 indikatör) ───
+    # Pine Script'teki pivot-tabanlı diverjans tespiti
+    div_result = _detect_multi_divergence(
+        close=close, high=high, low=low,
+        rsi=rsi13, macd=macd13, macd_hist=hist13,
+        stoch=stoch13, cci=cci, momentum=momentum,
+        obv=obv, vwmacd=vwmacd, cmf=cmf, mfi=mfi,
+        pivot_period=8, max_bars=144, max_pivots=13,
+    )
+    indicators["multi_div_bull_count"]   = div_result["bull_count"]
+    indicators["multi_div_bear_count"]   = div_result["bear_count"]
+    indicators["multi_div_bull_names"]   = div_result["bull_names"]
+    indicators["multi_div_bear_names"]   = div_result["bear_names"]
+    indicators["multi_div_bull_signal"]  = div_result["bull_count"] >= 2
+    indicators["multi_div_bear_signal"]  = div_result["bear_count"] >= 2
+
+    # Eski basit diverjans (geriye uyumluluk)
     lookback = min(8, len(df) - 1)
     price_low_now  = close.iloc[-1]
     price_low_prev = close.iloc[-lookback-1:-1].min()
