@@ -441,3 +441,46 @@ class CapitalAdapter(BrokerAdapter):
             asyncio.create_task(self.load_trademinds_watchlist())
 
         return self._cached_watchlist_symbols
+
+    async def get_closed_transactions(self, hours_back: int = 2) -> dict:
+        """Capital.com'dan kapanan trade'lerin PnL bilgisini çeker.
+        
+        Returns:
+            dict: {dealId: {"pnl": float, "symbol": str, "date": str}}
+        """
+        try:
+            now = datetime.utcnow()
+            frm = (now - timedelta(hours=hours_back)).strftime("%Y-%m-%dT%H:%M:%S")
+            to = now.strftime("%Y-%m-%dT%H:%M:%S")
+
+            async with self.session.get(
+                f"{self.BASE_URL}/history/transactions",
+                headers=self._get_headers(),
+                params={"from": frm, "to": to, "pageSize": "50"},
+            ) as resp:
+                if resp.status != 200:
+                    logger.warning(f"Capital.com transactions API: {resp.status}")
+                    return {}
+                data = await resp.json()
+
+            result = {}
+            for txn in data.get("transactions", []):
+                if txn.get("transactionType") == "TRADE" and txn.get("note") == "Trade closed":
+                    deal_id = txn.get("dealId", "")
+                    try:
+                        pnl = float(txn.get("size", 0))
+                    except (ValueError, TypeError):
+                        pnl = 0.0
+                    result[deal_id] = {
+                        "pnl": pnl,
+                        "symbol": txn.get("instrumentName", ""),
+                        "date": txn.get("dateUtc", ""),
+                    }
+
+            if result:
+                logger.info(f"[transactions] Found {len(result)} closed trades")
+            return result
+
+        except Exception as e:
+            logger.error(f"Capital.com transactions error: {e}")
+            return {}

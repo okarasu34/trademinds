@@ -127,13 +127,42 @@ async def trade_sync_job():
                     closed_count = 0
                     updated_count = 0
 
-                    # 1. DB'de OPEN ama Capital.com'da olmayan → CLOSED
-                    for trade in open_trades:
-                        if trade.broker_order_id not in live_map:
-                            trade.status    = OrderStatus.CLOSED
-                            trade.closed_at = datetime.utcnow()
-                            trade.closed_by = "bot"
-                            closed_count += 1
+                    # Kapanan trade'ler varsa PnL'lerini transactions'dan çek
+                    closing_trades = [
+                        t for t in open_trades
+                        if t.broker_order_id not in live_map
+                    ]
+                    
+                    closed_txns = {}
+                    if closing_trades:
+                        closed_txns = await adapter.get_closed_transactions(hours_back=2)
+
+                    # 1. DB'de OPEN ama Capital.com'da olmayan → CLOSED + PnL
+                    for trade in closing_trades:
+                        trade.status    = OrderStatus.CLOSED
+                        trade.closed_at = datetime.utcnow()
+                        trade.closed_by = "bot"
+                        
+                        # Transactions'dan PnL al
+                        txn = closed_txns.get(trade.broker_order_id)
+                        if txn:
+                            trade.pnl = txn["pnl"]
+                            logger.info(
+                                f"[trade_sync] Closed: {trade.symbol} "
+                                f"pnl={txn['pnl']}"
+                            )
+                        elif trade.pnl is not None:
+                            # Son bilinen PnL'i koru (önceki sync'ten)
+                            logger.info(
+                                f"[trade_sync] Closed: {trade.symbol} "
+                                f"pnl={trade.pnl} (last known)"
+                            )
+                        else:
+                            logger.warning(
+                                f"[trade_sync] Closed: {trade.symbol} "
+                                f"pnl=UNKNOWN (no transaction found)"
+                            )
+                        closed_count += 1
 
                     # 2. DB'deki OPEN trade'lerin PnL'ini güncelle
                     for trade in open_trades:
