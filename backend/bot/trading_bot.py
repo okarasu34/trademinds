@@ -293,12 +293,134 @@ class SmartMoneyStrategy:
         return None
 
 
+class HybridStrategy:
+    """Üç stratejinin güçlü yanlarını birleştiren hibrit strateji.
+    
+    Market tipine göre sinyal üretici seçer, Smart Money ile teyit eder.
+    
+    Yönlendirme:
+      Stock  → Alpha Trend (trend takibi güçlü)
+      Crypto → Multi Divergence (dönüş tespiti güçlü)
+      Index  → Multi Divergence
+      Commodity → Multi Divergence
+      Forex  → Multi Divergence
+    
+    Smart Money teyidi (tüm marketler):
+      - Order Block uyumu → confidence +0.08
+      - FVG uyumu → confidence +0.05
+      - POC yakınlığı → confidence +0.05
+      - Smart Money ters yönde → confidence -0.08
+    """
+
+    # Market tipi → strateji eşleşmesi
+    MARKET_STRATEGY = {
+        "stock": "alpha_trend",
+        "crypto": "multi_divergence",
+        "index": "multi_divergence",
+        "commodity": "multi_divergence",
+        "forex": "multi_divergence",
+    }
+
+    @staticmethod
+    def _infer_market(symbol: str) -> str:
+        s = symbol.upper()
+        if any(c in s for c in ("BTC","ETH","XRP","DOGE","SOL","ADA","AAVE","AVAX","LTC","SHIB","PEPE","TRX","HBAR","XLM","ALPHA","USDT")):
+            return "crypto"
+        if any(c in s for c in ("XAU","XAG","OIL","GAS","GOLD","SILVER","PLATINUM","PALLADIUM","COPPER","CORN","WHEAT","NATURALGAS","BRENT")):
+            return "commodity"
+        if any(c in s for c in ("SPX","NDX","DJI","DAX","FTSE","NKY","US100","US500","US30","DE40")):
+            return "index"
+        if len(s) == 6 and s.isalpha():
+            return "forex"
+        return "stock"
+
+    @staticmethod
+    def _smart_money_confirm(ind: dict, side: OrderSide, confidence: float) -> tuple[float, str]:
+        """Smart Money teyidi — OB + FVG + POC ile confidence ayarla."""
+        in_bull_ob = ind.get("in_bullish_ob", False)
+        in_bear_ob = ind.get("in_bearish_ob", False)
+        bull_fvg   = ind.get("bull_fvg", False)
+        bear_fvg   = ind.get("bear_fvg", False)
+        poc_prox   = ind.get("poc_proximity_pct", 999)
+        sm_notes   = []
+
+        if side == OrderSide.BUY:
+            # Bullish OB'de → güçlü teyit
+            if in_bull_ob:
+                confidence += 0.08
+                sm_notes.append("BullOB")
+            # Bearish OB'de → ters sinyal, ceza
+            elif in_bear_ob:
+                confidence -= 0.08
+                sm_notes.append("BearOB↓")
+            # Bullish FVG
+            if bull_fvg:
+                confidence += 0.05
+                sm_notes.append("BullFVG")
+            # POC yakını
+            if poc_prox <= 0.5:
+                confidence += 0.05
+                sm_notes.append(f"POC({poc_prox:.1f}%)")
+
+        elif side == OrderSide.SELL:
+            if in_bear_ob:
+                confidence += 0.08
+                sm_notes.append("BearOB")
+            elif in_bull_ob:
+                confidence -= 0.08
+                sm_notes.append("BullOB↓")
+            if bear_fvg:
+                confidence += 0.05
+                sm_notes.append("BearFVG")
+            if poc_prox <= 0.5:
+                confidence += 0.05
+                sm_notes.append(f"POC({poc_prox:.1f}%)")
+
+        return confidence, " ".join(sm_notes) if sm_notes else ""
+
+    @staticmethod
+    def generate(ind: dict, params: dict) -> Optional[tuple[OrderSide, float, str]]:
+        # Sembol bilgisi indicators'dan gelmiyor, params'dan alıyoruz
+        symbol = params.get("_symbol", "")
+        market = HybridStrategy._infer_market(symbol)
+        strategy_type = HybridStrategy.MARKET_STRATEGY.get(market, "multi_divergence")
+
+        result = None
+        source_name = ""
+
+        # ── Market tipine göre sinyal üret ──
+        if strategy_type == "alpha_trend":
+            result = AlphaTrendStrategy.generate(ind, params)
+            source_name = "AT"
+        else:
+            result = MultiDivergenceStrategy.generate(ind, params)
+            source_name = "MD"
+
+        if not result:
+            return None
+
+        side, confidence, reasoning = result
+
+        # ── Smart Money teyidi ──
+        sm_confidence, sm_notes = HybridStrategy._smart_money_confirm(ind, side, confidence)
+
+        # Final confidence
+        final_conf = min(max(sm_confidence, 0.40), 0.95)
+
+        # Reasoning birleştir
+        sm_text = f" | SM:[{sm_notes}]" if sm_notes else ""
+        final_reasoning = f"[Hybrid:{source_name}/{market}] {reasoning}{sm_text}"
+
+        return (side, final_conf, final_reasoning)
+
+
 # ─────────────────────── STRATEJİ FACTORY ───────────────────────
 
 STRATEGY_MAP = {
     "Alpha Trend":      AlphaTrendStrategy,
     "Multi Divergence": MultiDivergenceStrategy,
     "Smart Money":      SmartMoneyStrategy,
+    "Hybrid":           HybridStrategy,
 }
 
 
@@ -1052,7 +1174,9 @@ class TradingBot:
             return
 
         # Strateji sinyali üret
-        result = strategy_class.generate(ind, strategy.parameters or {})
+        strat_params = dict(strategy.parameters or {})
+        strat_params["_symbol"] = symbol  # HybridStrategy market tipi için
+        result = strategy_class.generate(ind, strat_params)
         if not result:
             return
 
