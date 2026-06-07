@@ -135,7 +135,7 @@ async def trade_sync_job():
                     
                     closed_txns = {}
                     if closing_trades:
-                        closed_txns = await adapter.get_closed_transactions(hours_back=2)
+                        closed_txns = await adapter.get_closed_transactions(hours_back=6)
 
                     # 1. DB'de OPEN ama Capital.com'da olmayan → CLOSED + PnL
                     for trade in closing_trades:
@@ -144,7 +144,15 @@ async def trade_sync_job():
                         trade.closed_by = "bot"
                         
                         # Transactions'dan PnL al
+                        # Önce dealId ile dene, bulamazsa sembol ile eşleştir
                         txn = closed_txns.get(trade.broker_order_id)
+                        if not txn:
+                            # dealId eşleşmedi — sembol ile ara
+                            for txn_id, txn_data in closed_txns.items():
+                                if txn_data["symbol"] == trade.symbol:
+                                    txn = txn_data
+                                    break
+                        
                         if txn:
                             trade.pnl = txn["pnl"]
                             logger.info(
