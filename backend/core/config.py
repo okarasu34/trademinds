@@ -48,6 +48,12 @@ class Settings(BaseSettings):
     BOT_NEWS_PAUSE_MINUTES: int = 30          # pause before high-impact news
     BOT_MAX_MARGIN_PCT: float = 10.0          # max toplam margin % of equity
 
+    # Profit Guard
+    PROFIT_GUARD_ENABLED: bool = True          # kâr koruma aktif mi
+    PROFIT_GUARD_LOCK_EUR: float = 10.0        # kâr kilidi eşiği (EUR)
+    PROFIT_GUARD_DROP_PCT: float = 40.0        # zirveden düşüş % → kapat
+    PROFIT_GUARD_INTERVAL: int = 60            # kontrol sıklığı (saniye)
+
     # Currency
     BASE_CURRENCY: str = "USD"               # USD or EUR
 

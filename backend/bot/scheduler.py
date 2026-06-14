@@ -8,6 +8,9 @@ Job'lar:
      - Capital.com'da açık ama DB'de olmayan → DB'ye ekle
      - DB'de OPEN ama Capital.com'da olmayan → CLOSED yap + PnL yaz
      - DB'deki açık pozisyonların PnL'ini güncelle
+  4. profit_guard: Her 1 dakikada bir kâr koruma
+     - Kâra geçen pozisyonların zirvesini takip et
+     - Zirveden belirli oranda düşerse pozisyonu kapat
 """
 from datetime import datetime
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -17,8 +20,10 @@ from sqlalchemy import select
 
 from db.database import AsyncSessionLocal
 from db.models import BrokerAccount, Trade, OrderStatus, MarketType, OrderSide, TradeMode
+from db.redis_client import cache_set, cache_get
 from brokers.capital_adapter import CapitalAdapter
 from bot.trading_bot import bot_instance
+from core.config import settings
 
 
 scheduler = AsyncIOScheduler(timezone="UTC")
@@ -222,6 +227,138 @@ async def trade_sync_job():
             logger.exception(f"trade_sync_job failed: {e}")
 
 
+async def profit_guard_job():
+    """Kâr koruma — açık pozisyonları izle, kârı koru.
+    
+    1. Her açık pozisyonun anlık PnL'ini çek
+    2. PnL >= kâr kilidi eşiği → koruma aktif
+    3. Zirve PnL'i Redis'te tut
+    4. PnL zirveden belirli oranda düştüyse → pozisyonu kapat
+    """
+    if not settings.PROFIT_GUARD_ENABLED:
+        return
+
+    lock_eur  = settings.PROFIT_GUARD_LOCK_EUR   # default: 10 EUR
+    drop_pct  = settings.PROFIT_GUARD_DROP_PCT    # default: 40%
+
+    try:
+        async with AsyncSessionLocal() as db:
+            # Aktif broker'ları al
+            brokers_result = await db.execute(
+                select(BrokerAccount).where(BrokerAccount.is_active == True)
+            )
+            brokers = brokers_result.scalars().all()
+
+            for broker in brokers:
+                try:
+                    adapter = CapitalAdapter(broker)
+                    if not await adapter.connect():
+                        continue
+
+                    # Capital.com'dan açık pozisyonları çek
+                    live_positions = await adapter.get_open_orders()
+                    if not live_positions:
+                        await adapter.disconnect()
+                        continue
+
+                    closed_count = 0
+
+                    for pos in live_positions:
+                        pnl = pos.pnl
+                        if pnl is None:
+                            continue
+
+                        redis_key = f"profit_guard:{broker.id}:{pos.order_id}"
+
+                        # ── PnL kâr eşiğinin altında → henüz koruma yok ──
+                        if pnl < lock_eur:
+                            # Daha önce koruma aktifti ama PnL düştüyse
+                            # (bu SL'e yaklaşıyor demek, müdahale etme)
+                            continue
+
+                        # ── Kâr kilidi aktif — zirve takibi ──
+                        cached = await cache_get(redis_key)
+
+                        if cached:
+                            peak_pnl = cached.get("peak_pnl", pnl)
+                        else:
+                            peak_pnl = pnl
+                            logger.info(
+                                f"[profit_guard] {pos.symbol} kâr kilidi aktif! "
+                                f"PnL={pnl:.2f} EUR"
+                            )
+
+                        # Yeni zirve mi?
+                        if pnl > peak_pnl:
+                            peak_pnl = pnl
+                            logger.info(
+                                f"[profit_guard] {pos.symbol} yeni zirve: {peak_pnl:.2f} EUR"
+                            )
+
+                        # Zirveyi Redis'e kaydet (24 saat TTL)
+                        await cache_set(redis_key, {
+                            "peak_pnl": peak_pnl,
+                            "lock_activated": True,
+                            "symbol": pos.symbol,
+                        }, ttl=86400)
+
+                        # ── Düşüş kontrolü ──
+                        if peak_pnl > 0:
+                            drop_from_peak = ((peak_pnl - pnl) / peak_pnl) * 100
+
+                            if drop_from_peak >= drop_pct:
+                                # KAPAT!
+                                logger.warning(
+                                    f"[profit_guard] {pos.symbol} KAPATILIYOR! "
+                                    f"Zirve={peak_pnl:.2f} → Şimdi={pnl:.2f} "
+                                    f"(düşüş: %{drop_from_peak:.1f})"
+                                )
+
+                                success = await adapter.close_order(pos.order_id, pos.symbol)
+
+                                if success:
+                                    closed_count += 1
+                                    logger.success(
+                                        f"[profit_guard] {pos.symbol} KAPATILDI! "
+                                        f"Kâr korundu: {pnl:.2f} EUR "
+                                        f"(zirve: {peak_pnl:.2f})"
+                                    )
+
+                                    # DB'de trade'i güncelle
+                                    trade_result = await db.execute(
+                                        select(Trade).where(
+                                            Trade.broker_order_id == pos.order_id,
+                                            Trade.status == OrderStatus.OPEN,
+                                        )
+                                    )
+                                    trade = trade_result.scalars().first()
+                                    if trade:
+                                        trade.status    = OrderStatus.CLOSED
+                                        trade.pnl       = pnl
+                                        trade.closed_at  = datetime.utcnow()
+                                        trade.closed_by  = "profit_guard"
+                                        trade.ai_reasoning = (trade.ai_reasoning or "") + f" | PG: peak={peak_pnl:.2f} close={pnl:.2f}"
+
+                                    # Redis'ten sil
+                                    await cache_set(redis_key, None, ttl=1)
+                                else:
+                                    logger.error(
+                                        f"[profit_guard] {pos.symbol} kapatma BAŞARISIZ!"
+                                    )
+
+                    if closed_count:
+                        await db.commit()
+                        logger.info(f"[profit_guard] {closed_count} pozisyon kapatıldı")
+
+                    await adapter.disconnect()
+
+                except Exception as e:
+                    logger.exception(f"[profit_guard] {broker.name} error: {e}")
+
+    except Exception as e:
+        logger.exception(f"profit_guard_job failed: {e}")
+
+
 def setup_scheduler():
     scheduler.add_job(
         bot_scan_job,
@@ -250,5 +387,20 @@ def setup_scheduler():
         coalesce=True,
     )
 
+    # Profit Guard — her 1 dakikada bir kâr koruma
+    if settings.PROFIT_GUARD_ENABLED:
+        scheduler.add_job(
+            profit_guard_job,
+            IntervalTrigger(seconds=settings.PROFIT_GUARD_INTERVAL, start_date="2000-01-01 00:00:30"),
+            id="profit_guard",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+        )
+
     scheduler.start()
-    logger.info(">>> Scheduler started: bot_scan + balance_sync + trade_sync (every 5 min)")
+    pg_status = "ON" if settings.PROFIT_GUARD_ENABLED else "OFF"
+    logger.info(
+        f">>> Scheduler started: bot_scan + balance_sync + trade_sync (every 5 min) "
+        f"+ profit_guard ({pg_status}, every {settings.PROFIT_GUARD_INTERVAL}s)"
+    )
