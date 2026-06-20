@@ -460,80 +460,108 @@ class OrderedSymbolCache:
 
 
 class TrendFilter:
-    """EMA200 + EMA50 trend filtresi.
+    """EMA200 + EMA50 trend filtresi (YUMUŞAK).
     
-    BUY: fiyat > EMA89 VE EMA50 > EMA89
-    SELL: fiyat < EMA89 VE EMA50 < EMA89
+    Sert red yerine confidence düşürür.
+    BUY + trend aşağı → confidence -0.12
+    EMA50 teyidi yok → confidence -0.08
     """
 
     @staticmethod
-    def check(signal: Signal, ind: dict) -> tuple[bool, str]:
+    def check(signal: Signal, ind: dict) -> tuple[float, str]:
+        """Returns (confidence_adjustment, message)"""
         ema_long  = ind.get("ema_89") or ind.get("ema_200")
         ema_mid   = ind.get("ema_50")
         price     = ind.get("current_price")
 
         if not ema_long or not price:
-            return True, "OK"  # veri yoksa geç
+            return 0.0, ""
 
         trend_up = price > ema_long
+        adjustment = 0.0
+        notes = []
 
-        # EMA50 filtresi (varsa ekstra güç)
+        # EMA50 teyidi
         if ema_mid:
             ema_confirms = (ema_mid > ema_long) if trend_up else (ema_mid < ema_long)
             if not ema_confirms:
-                return False, (
-                    f"EMA50 trend teyidi yok: "
-                    f"EMA50={ema_mid:.5f} {'<' if trend_up else '>'} EMA89={ema_long:.5f}"
-                )
+                adjustment -= 0.08
+                notes.append(f"EMA50 teyidi yok({adjustment:.2f})")
 
+        # Trend yönü kontrolü
         if signal.side == OrderSide.BUY and not trend_up:
-            return False, f"REJECTED by Trend: BUY ama trend ASAGI (price={price:.5f} < EMA={ema_long:.5f})"
-        if signal.side == OrderSide.SELL and trend_up:
-            return False, f"REJECTED by Trend: SELL ama trend YUKARI (price={price:.5f} > EMA={ema_long:.5f})"
+            adjustment -= 0.12
+            notes.append(f"Trend ASAGI({adjustment:.2f})")
+        elif signal.side == OrderSide.SELL and trend_up:
+            adjustment -= 0.12
+            notes.append(f"Trend YUKARI({adjustment:.2f})")
 
-        return True, "OK"
+        return adjustment, " | ".join(notes)
 
 
 class RSIFilter:
-    """RSI aralık filtresi.
+    """RSI aralık filtresi (YUMUŞAK).
     
-    BUY: RSI 35-65 arası (aşırı alımda değil)
-    SELL: RSI 35-65 arası (aşırı satımda değil)
+    Sert red yerine confidence düşürür.
+    RSI 65-75 → confidence -0.08
+    RSI > 75 → confidence -0.15
+    RSI 25-35 → confidence -0.08
+    RSI < 25 → confidence -0.15
     """
 
     @staticmethod
-    def check(signal: Signal, ind: dict) -> tuple[bool, str]:
+    def check(signal: Signal, ind: dict) -> tuple[float, str]:
+        """Returns (confidence_adjustment, message)"""
         rsi = ind.get("rsi_14") or ind.get("rsi_13")
         if not rsi:
-            return True, "OK"
+            return 0.0, ""
 
-        if signal.side == OrderSide.BUY and rsi > 65:
-            return False, f"REJECTED by RSI: BUY ama RSI aşırı alım ({rsi:.1f} > 65)"
-        if signal.side == OrderSide.SELL and rsi < 35:
-            return False, f"REJECTED by RSI: SELL ama RSI aşırı satım ({rsi:.1f} < 35)"
+        adjustment = 0.0
+        note = ""
 
-        return True, "OK"
+        if signal.side == OrderSide.BUY:
+            if rsi > 75:
+                adjustment = -0.15
+                note = f"RSI çok yüksek({rsi:.1f})"
+            elif rsi > 65:
+                adjustment = -0.08
+                note = f"RSI yüksek({rsi:.1f})"
+        elif signal.side == OrderSide.SELL:
+            if rsi < 25:
+                adjustment = -0.15
+                note = f"RSI çok düşük({rsi:.1f})"
+            elif rsi < 35:
+                adjustment = -0.08
+                note = f"RSI düşük({rsi:.1f})"
+
+        return adjustment, note
 
 
 class MACDFilter:
-    """MACD teyidi filtresi.
+    """MACD teyidi filtresi (YUMUŞAK).
     
-    BUY: MACD histogram pozitif (yukarı momentum)
-    SELL: MACD histogram negatif (aşağı momentum)
+    Sert red yerine confidence düşürür.
+    Histogram ters yönde → confidence -0.08
     """
 
     @staticmethod
-    def check(signal: Signal, ind: dict) -> tuple[bool, str]:
+    def check(signal: Signal, ind: dict) -> tuple[float, str]:
+        """Returns (confidence_adjustment, message)"""
         hist = ind.get("macd13_histogram") or ind.get("macd_histogram")
         if hist is None:
-            return True, "OK"
+            return 0.0, ""
+
+        adjustment = 0.0
+        note = ""
 
         if signal.side == OrderSide.BUY and hist < 0:
-            return False, f"REJECTED by MACD: BUY ama histogram negatif ({hist:.5f})"
-        if signal.side == OrderSide.SELL and hist > 0:
-            return False, f"REJECTED by MACD: SELL ama histogram pozitif ({hist:.5f})"
+            adjustment = -0.08
+            note = f"MACD negatif({hist:.5f})"
+        elif signal.side == OrderSide.SELL and hist > 0:
+            adjustment = -0.08
+            note = f"MACD pozitif({hist:.5f})"
 
-        return True, "OK"
+        return adjustment, note
 
 
 # ─────────────────────── ★ NEWS GUARD ───────────────────────
@@ -1215,25 +1243,47 @@ class TradingBot:
 
         logger.info(f"[{symbol}] [{strategy.name}] Signal: {side.value} conf={confidence:.2f} | {reasoning}")
 
-        # ── FILTRELER ──
+        # ── YUMUŞAK FILTRELER (confidence ayarlama) ──
+        MIN_CONFIDENCE = 0.50  # Bu eşiğin altına düşerse sinyal iptal
 
-        # 1. Trend filtresi (EMA200 + EMA50)
-        ok, msg = TrendFilter.check(signal, ind)
-        if not ok:
-            logger.info(f"[{symbol}] {msg}")
+        filter_notes = []
+
+        # 1. Trend filtresi (yumuşak)
+        trend_adj, trend_note = TrendFilter.check(signal, ind)
+        if trend_adj != 0:
+            signal.confidence += trend_adj
+            filter_notes.append(f"Trend:{trend_adj:+.2f}")
+            if trend_note:
+                logger.info(f"[{symbol}] Soft Trend: {trend_note} → conf={signal.confidence:.2f}")
+
+        # 2. RSI filtresi (yumuşak)
+        rsi_adj, rsi_note = RSIFilter.check(signal, ind)
+        if rsi_adj != 0:
+            signal.confidence += rsi_adj
+            filter_notes.append(f"RSI:{rsi_adj:+.2f}")
+            if rsi_note:
+                logger.info(f"[{symbol}] Soft RSI: {rsi_note} → conf={signal.confidence:.2f}")
+
+        # 3. MACD filtresi (yumuşak)
+        macd_adj, macd_note = MACDFilter.check(signal, ind)
+        if macd_adj != 0:
+            signal.confidence += macd_adj
+            filter_notes.append(f"MACD:{macd_adj:+.2f}")
+            if macd_note:
+                logger.info(f"[{symbol}] Soft MACD: {macd_note} → conf={signal.confidence:.2f}")
+
+        # Minimum confidence kontrolü
+        if signal.confidence < MIN_CONFIDENCE:
+            all_notes = " | ".join(filter_notes)
+            logger.info(
+                f"[{symbol}] REJECTED by Soft Filters: "
+                f"conf={signal.confidence:.2f} < {MIN_CONFIDENCE} | {all_notes}"
+            )
             return
 
-        # 2. RSI filtresi (35-65 aralığı)
-        ok, msg = RSIFilter.check(signal, ind)
-        if not ok:
-            logger.info(f"[{symbol}] {msg}")
-            return
-
-        # 3. MACD histogram teyidi
-        ok, msg = MACDFilter.check(signal, ind)
-        if not ok:
-            logger.info(f"[{symbol}] {msg}")
-            return
+        # Filtre notlarını reasoning'e ekle
+        if filter_notes:
+            signal.reasoning += f" | Filters:[{' '.join(filter_notes)}]"
 
         # ★ 4. NEWS GUARD — High-impact haber filtresi
         ok, msg, news_events = await NewsGuard.check(symbol)
