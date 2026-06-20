@@ -282,19 +282,40 @@ class CapitalAdapter(BrokerAdapter):
             return None
 
     async def close_order(self, order_id: str, symbol: str) -> bool:
+        """Pozisyonu kapat. dealId ve dealReference farkını yönetir."""
         try:
-            positions = await self.get_open_orders()
-            position  = next((p for p in positions if p.order_id == order_id), None)
+            # Raw pozisyonları çek — dealId'yi almak için
+            async with self.session.get(
+                f"{self.BASE_URL}/positions",
+                headers=self._get_headers()
+            ) as resp:
+                if resp.status != 200:
+                    logger.error(f"Capital.com get positions failed: {resp.status}")
+                    return False
+                data = await resp.json()
 
-            if not position:
-                logger.warning(f"Position {order_id} not found")
+            # order_id ile eşleşen pozisyonu bul (dealReference veya dealId)
+            position_data = None
+            for pos in data.get("positions", []):
+                p = pos.get("position", {})
+                deal_ref = p.get("dealReference", "")
+                deal_id  = p.get("dealId", "")
+                if order_id in (deal_ref, deal_id):
+                    position_data = pos
+                    break
+
+            if not position_data:
+                logger.warning(f"Position {order_id} not found for close")
                 return False
 
-            direction = "SELL" if position.side == "buy" else "BUY"
+            p = position_data.get("position", {})
+            actual_deal_id = p.get("dealId", "")
+            direction = "SELL" if p.get("direction", "").upper() == "BUY" else "BUY"
+            size = p.get("size", 0)
 
             async with self.session.delete(
                 f"{self.BASE_URL}/positions",
-                json={"dealId": order_id, "direction": direction, "size": position.lot_size},
+                json={"dealId": actual_deal_id, "direction": direction, "size": size},
                 headers=self._get_headers()
             ) as resp:
                 if resp.status not in [200, 201]:
@@ -302,7 +323,7 @@ class CapitalAdapter(BrokerAdapter):
                     logger.error(f"Capital.com close_order failed: {resp.status} - {text}")
                     return False
 
-                logger.info(f"Position closed: {order_id}")
+                logger.info(f"Position closed: {symbol} dealId={actual_deal_id}")
                 return True
 
         except Exception as e:
