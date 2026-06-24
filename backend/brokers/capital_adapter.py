@@ -357,7 +357,7 @@ class CapitalAdapter(BrokerAdapter):
 
                     deal_ref = position_data.get("dealReference", "")
                     deal_id  = position_data.get("dealId", "")
-                    order_id = deal_ref if deal_ref else deal_id
+                    order_id = deal_id if deal_id else deal_ref
 
                     orders.append(OpenOrder(
                         order_id      = order_id,
