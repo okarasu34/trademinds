@@ -21,7 +21,7 @@ from sqlalchemy import select
 from db.database import AsyncSessionLocal
 from db.models import BrokerAccount, Trade, OrderStatus, MarketType, OrderSide, TradeMode
 from db.redis_client import cache_set, cache_get
-from brokers.capital_adapter import CapitalAdapter
+from brokers.base_adapter import get_broker_adapter
 from bot.trading_bot import bot_instance
 from core.config import settings
 
@@ -61,7 +61,7 @@ async def balance_sync_job():
                 if broker.broker_type != "capitalcom":
                     continue
                 try:
-                    adapter = CapitalAdapter(broker)
+                    adapter = get_broker_adapter(broker)
                     if not await adapter.connect():
                         logger.warning(f"[balance_sync] {broker.name}: connect failed")
                         continue
@@ -104,7 +104,7 @@ async def trade_sync_job():
                     continue
 
                 try:
-                    adapter = CapitalAdapter(broker)
+                    adapter = get_broker_adapter(broker)
                     if not await adapter.connect():
                         logger.warning(f"[trade_sync] {broker.name}: connect failed")
                         continue
@@ -129,44 +129,14 @@ async def trade_sync_job():
                     open_trades = open_trades_result.scalars().all()
                     db_order_ids = {t.broker_order_id for t in open_trades if t.broker_order_id}
 
-                    # dealReference → dealId mapping (adapter'dan)
-                    ref_map = getattr(adapter, '_deal_ref_map', {})
-                    
-                    # DB'deki dealReference'ları dealId'ye çevir
-                    for trade in open_trades:
-                        if trade.broker_order_id in ref_map:
-                            mapped_id = ref_map[trade.broker_order_id]
-                            if mapped_id in live_map and trade.broker_order_id not in live_map:
-                                # dealReference → dealId güncelle
-                                old_ref = trade.broker_order_id
-                                trade.broker_order_id = mapped_id
-                                db_order_ids.discard(old_ref)
-                                db_order_ids.add(mapped_id)
-                                logger.info(f"[trade_sync] ID fix: {trade.symbol} {old_ref[:20]}→{mapped_id[:20]}")
-
                     closed_count = 0
                     updated_count = 0
 
                     # Kapanan trade'ler varsa PnL'lerini transactions'dan çek
-                    # Sembol + ID bazlı eşleşme (dealRef/dealId farkını yönetir)
-                    live_symbols = {p.symbol: p for p in live_positions}
-                    live_ids = set(live_map.keys())
-                    
-                    closing_trades = []
-                    for t in open_trades:
-                        # Önce ID ile eşleştir
-                        if t.broker_order_id in live_ids:
-                            continue  # eşleşti, açık
-                        # ID eşleşmediyse sembol ile kontrol et
-                        if t.symbol in live_symbols:
-                            # Aynı sembol açık — ID'yi güncelle
-                            live_pos = live_symbols[t.symbol]
-                            old_id = t.broker_order_id
-                            t.broker_order_id = live_pos.order_id
-                            logger.info(f"[trade_sync] ID fix: {t.symbol} {old_id[:16]}→{live_pos.order_id[:16]}")
-                            continue  # eşleşti, açık
-                        # Ne ID ne sembol eşleşti — kapanmış
-                        closing_trades.append(t)
+                    closing_trades = [
+                        t for t in open_trades
+                        if t.broker_order_id not in live_map
+                    ]
                     
                     closed_txns = {}
                     if closing_trades:
@@ -209,19 +179,16 @@ async def trade_sync_job():
 
                     # 2. DB'deki OPEN trade'lerin PnL'ini güncelle
                     for trade in open_trades:
-                        matched = live_map.get(trade.broker_order_id)
-                        if not matched and trade.symbol in live_symbols:
-                            matched = live_symbols[trade.symbol]
-                        if matched:
-                            trade.pnl        = matched.pnl
-                            trade.exit_price = matched.current_price
+                        if trade.broker_order_id in live_map:
+                            live = live_map[trade.broker_order_id]
+                            trade.pnl        = live.pnl
+                            trade.exit_price = live.current_price
                             updated_count += 1
 
                     # 3. Capital.com'da açık ama DB'de olmayan → ekle
                     added_count = 0
-                    db_symbols = {t.symbol for t in open_trades if t.status.value == "OPEN"}
                     for order_id, pos in live_map.items():
-                        if order_id not in db_order_ids and pos.symbol not in db_symbols:
+                        if order_id not in db_order_ids:
                             new_trade = Trade(
                                 user_id         = user_id,
                                 broker_id       = broker.id,
@@ -284,7 +251,7 @@ async def profit_guard_job():
 
             for broker in brokers:
                 try:
-                    adapter = CapitalAdapter(broker)
+                    adapter = get_broker_adapter(broker)
                     if not await adapter.connect():
                         continue
 

@@ -53,6 +53,7 @@ const TABS = [
   { id: "positions", label: "Positions", icon: "📊" },
   { id: "history", label: "History", icon: "📋" },
   { id: "strategies", label: "Strategies", icon: "🧠" },
+  { id: "brokers", label: "Brokers", icon: "🔗" },
   { id: "calendar", label: "Calendar", icon: "📅" },
   { id: "settings", label: "Settings", icon: "⚙️" },
 ];
@@ -527,6 +528,7 @@ export default function Dashboard() {
 
         {/* ── Strategies Tab ── */}
         {tab === "strategies" && <StrategiesPanel />}
+        {tab === "brokers" && <BrokersPanel />}
 
         {/* Loading state */}
         {!s && tab === "dashboard" && (
@@ -677,6 +679,194 @@ function StrategiesPanel() {
           </div>
         ))}
       </div>
+    </div>
+  );
+}
+
+// ── Brokers Panel ──
+function BrokersPanel() {
+  const [brokers, setBrokers] = useState<any[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [showAdd, setShowAdd] = useState(false);
+  const [testing, setTesting] = useState<string | null>(null);
+  const [form, setForm] = useState({ name: "", broker_type: "capital", api_key: "", api_secret: "", extra: "", market_type: "MULTI" });
+
+  useEffect(() => {
+    loadBrokers();
+  }, []);
+
+  const loadBrokers = async () => {
+    try {
+      const { brokersApi } = await import("../utils/api");
+      const r = await brokersApi.list();
+      setBrokers(r.data);
+    } catch {}
+    setLoading(false);
+  };
+
+  const toggle = async (id: string) => {
+    const { brokersApi } = await import("../utils/api");
+    await brokersApi.toggle(id);
+    await loadBrokers();
+  };
+
+  const testBroker = async (id: string) => {
+    setTesting(id);
+    try {
+      const { brokersApi } = await import("../utils/api");
+      const r = await brokersApi.test(id);
+      if (r.data.connected) {
+        toast.success(`Connected! Balance: ${r.data.balance} ${r.data.currency}`);
+      } else {
+        toast.error(`Connection failed: ${r.data.error}`);
+      }
+    } catch (e: any) {
+      toast.error("Test failed");
+    }
+    setTesting(null);
+    await loadBrokers();
+  };
+
+  const addBroker = async () => {
+    try {
+      const { brokersApi } = await import("../utils/api");
+      await brokersApi.add(form);
+      toast.success("Broker added!");
+      setShowAdd(false);
+      setForm({ name: "", broker_type: "capital", api_key: "", api_secret: "", extra: "", market_type: "MULTI" });
+      await loadBrokers();
+    } catch (e: any) {
+      toast.error("Failed to add broker");
+    }
+  };
+
+  const removeBroker = async (id: string) => {
+    if (!confirm("Are you sure?")) return;
+    try {
+      const { brokersApi } = await import("../utils/api");
+      await brokersApi.remove(id);
+      toast.success("Broker removed");
+      await loadBrokers();
+    } catch {
+      toast.error("Failed to remove");
+    }
+  };
+
+  if (loading) return <div style={{ padding: 40, textAlign: "center", color: "#64748b" }}>Loading...</div>;
+
+  const brokerTypes: Record<string, string> = {
+    capital: "Capital.com", ig: "IG Markets", ibkr: "Interactive Brokers",
+    binance: "Binance", bybit: "Bybit", mt5: "MetaTrader 5",
+  };
+
+  return (
+    <div style={{ padding: 24 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
+        <div style={{ fontSize: 15, fontWeight: 700 }}>Broker Accounts</div>
+        <button onClick={() => setShowAdd(!showAdd)}
+          style={{ background: "#3b82f6", color: "white", border: "none", borderRadius: 6, padding: "8px 16px", fontSize: 12, fontWeight: 600, cursor: "pointer" }}>
+          {showAdd ? "Cancel" : "+ Add Broker"}
+        </button>
+      </div>
+
+      {showAdd && (
+        <div style={{ background: "#111827", border: "1px solid #1e2d45", borderRadius: 10, padding: 20, marginBottom: 20 }}>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+            <div>
+              <label style={{ fontSize: 11, color: "#64748b", display: "block", marginBottom: 4 }}>Name</label>
+              <input value={form.name} onChange={e => setForm({ ...form, name: e.target.value })}
+                placeholder="e.g. IG Demo"
+                style={{ width: "100%", background: "#0d1421", border: "1px solid #1e2d45", borderRadius: 6, padding: "8px 10px", color: "#f1f5f9", fontSize: 13, outline: "none" }} />
+            </div>
+            <div>
+              <label style={{ fontSize: 11, color: "#64748b", display: "block", marginBottom: 4 }}>Broker Type</label>
+              <select value={form.broker_type} onChange={e => setForm({ ...form, broker_type: e.target.value })}
+                style={{ width: "100%", background: "#0d1421", border: "1px solid #1e2d45", borderRadius: 6, padding: "8px 10px", color: "#f1f5f9", fontSize: 13, outline: "none" }}>
+                {Object.entries(brokerTypes).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
+              </select>
+            </div>
+            <div>
+              <label style={{ fontSize: 11, color: "#64748b", display: "block", marginBottom: 4 }}>API Key</label>
+              <input value={form.api_key} onChange={e => setForm({ ...form, api_key: e.target.value })}
+                style={{ width: "100%", background: "#0d1421", border: "1px solid #1e2d45", borderRadius: 6, padding: "8px 10px", color: "#f1f5f9", fontSize: 13, outline: "none" }} />
+            </div>
+            <div>
+              <label style={{ fontSize: 11, color: "#64748b", display: "block", marginBottom: 4 }}>Password</label>
+              <input type="password" value={form.api_secret} onChange={e => setForm({ ...form, api_secret: e.target.value })}
+                style={{ width: "100%", background: "#0d1421", border: "1px solid #1e2d45", borderRadius: 6, padding: "8px 10px", color: "#f1f5f9", fontSize: 13, outline: "none" }} />
+            </div>
+            <div style={{ gridColumn: "1 / -1" }}>
+              <label style={{ fontSize: 11, color: "#64748b", display: "block", marginBottom: 4 }}>Email / Identifier (optional)</label>
+              <input value={form.extra} onChange={e => setForm({ ...form, extra: e.target.value })}
+                placeholder="e.g. your@email.com"
+                style={{ width: "100%", background: "#0d1421", border: "1px solid #1e2d45", borderRadius: 6, padding: "8px 10px", color: "#f1f5f9", fontSize: 13, outline: "none" }} />
+            </div>
+          </div>
+          <button onClick={addBroker}
+            style={{ marginTop: 14, background: "#10b981", color: "white", border: "none", borderRadius: 6, padding: "10px 24px", fontSize: 13, fontWeight: 600, cursor: "pointer" }}>
+            Add Broker
+          </button>
+        </div>
+      )}
+
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(300px, 1fr))", gap: 14 }}>
+        {brokers.map(b => (
+          <div key={b.id} style={{
+            background: "#111827",
+            border: `1px solid ${b.is_active ? "#10b981" : "#1e2d45"}`,
+            borderRadius: 10,
+            padding: 18,
+            opacity: b.is_active ? 1 : 0.7,
+          }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+              <div>
+                <div style={{ fontSize: 14, fontWeight: 700 }}>{b.name}</div>
+                <div style={{ fontSize: 11, color: "#64748b", marginTop: 2 }}>{brokerTypes[b.broker_type] || b.broker_type}</div>
+              </div>
+              <button onClick={() => toggle(b.id)}
+                style={{ width: 40, height: 22, borderRadius: 11, border: "none", background: b.is_active ? "#10b981" : "#1e2d45", cursor: "pointer", position: "relative", flexShrink: 0 }}>
+                <div style={{ width: 16, height: 16, borderRadius: "50%", background: "white", position: "absolute", top: 3, left: b.is_active ? 21 : 3, transition: "left 0.2s" }} />
+              </button>
+            </div>
+
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 12 }}>
+              <div style={{ background: "#0d1421", borderRadius: 6, padding: "8px 10px" }}>
+                <div style={{ fontSize: 10, color: "#64748b" }}>Balance</div>
+                <div style={{ fontSize: 14, fontWeight: 700 }}>{b.balance?.toFixed(2) || "—"} {b.currency || ""}</div>
+              </div>
+              <div style={{ background: "#0d1421", borderRadius: 6, padding: "8px 10px" }}>
+                <div style={{ fontSize: 10, color: "#64748b" }}>Status</div>
+                <div style={{ fontSize: 14, fontWeight: 700, color: b.is_connected ? "#10b981" : "#64748b" }}>
+                  {b.is_connected ? "Connected" : "Disconnected"}
+                </div>
+              </div>
+            </div>
+
+            <div style={{ display: "flex", gap: 8 }}>
+              <button onClick={() => testBroker(b.id)} disabled={testing === b.id}
+                style={{ flex: 1, background: "#1e2d45", color: "#60a5fa", border: "none", borderRadius: 6, padding: "8px", fontSize: 12, fontWeight: 600, cursor: "pointer", opacity: testing === b.id ? 0.5 : 1 }}>
+                {testing === b.id ? "Testing..." : "Test Connection"}
+              </button>
+              <button onClick={() => removeBroker(b.id)}
+                style={{ background: "#1e2d45", color: "#f87171", border: "none", borderRadius: 6, padding: "8px 12px", fontSize: 12, cursor: "pointer" }}>
+                ✕
+              </button>
+            </div>
+
+            {b.last_sync && (
+              <div style={{ fontSize: 10, color: "#64748b", marginTop: 8 }}>
+                Last sync: {new Date(b.last_sync).toLocaleString()}
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+
+      {brokers.length === 0 && (
+        <div style={{ textAlign: "center", color: "#64748b", padding: 40 }}>
+          No brokers configured. Click "+ Add Broker" to get started.
+        </div>
+      )}
     </div>
   );
 }

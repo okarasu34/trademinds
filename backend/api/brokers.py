@@ -53,6 +53,28 @@ async def remove_broker(broker_id: str, user: User = Depends(get_current_user), 
     await db.commit()
 
 
+@router.post("/{broker_id}/toggle")
+async def toggle_broker(broker_id: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    """Broker'ı aktif/deaktif et. Aktif edince diğerleri deaktif olur."""
+    r = await db.execute(select(BrokerAccount).where(BrokerAccount.id == broker_id, BrokerAccount.user_id == user.id))
+    broker = r.scalar_one_or_none()
+    if not broker:
+        raise HTTPException(404, "Broker not found")
+
+    if broker.is_active:
+        broker.is_active = False
+    else:
+        # Diğer broker'ları deaktif et
+        all_brokers = await db.execute(select(BrokerAccount).where(BrokerAccount.user_id == user.id))
+        for b in all_brokers.scalars().all():
+            b.is_active = False
+        broker.is_active = True
+
+    await db.commit()
+    await db.refresh(broker)
+    return _serialize(broker)
+
+
 @router.post("/{broker_id}/test")
 async def test_broker(broker_id: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     r = await db.execute(select(BrokerAccount).where(BrokerAccount.id == broker_id, BrokerAccount.user_id == user.id))

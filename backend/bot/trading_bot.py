@@ -30,7 +30,7 @@ from db.models import (
     OrderSide, OrderStatus, TradeMode, MarketType, AISignalLog
 )
 from db.redis_client import cache_set, cache_get
-from brokers.capital_adapter import CapitalAdapter
+from brokers.base_adapter import BrokerAdapter, get_broker_adapter
 from bot.indicators import calculate_indicators
 from data.calendar import calendar_client
 from core.config import settings
@@ -867,7 +867,7 @@ class PositionGuard:
 
 class DailyLossGuard:
     @staticmethod
-    async def check(config: BotConfig, db: AsyncSession, broker: BrokerAccount, adapter: CapitalAdapter) -> tuple[bool, str]:
+    async def check(config: BotConfig, db: AsyncSession, broker: BrokerAccount, adapter: BrokerAdapter) -> tuple[bool, str]:
         if not config.max_daily_loss_pct or config.max_daily_loss_pct <= 0:
             return True, "OK"
         try:
@@ -904,7 +904,7 @@ class MarginGuard:
     """
 
     @staticmethod
-    async def check(adapter: CapitalAdapter) -> tuple[bool, str]:
+    async def check(adapter: BrokerAdapter) -> tuple[bool, str]:
         try:
             info = await adapter.get_account_info()
         except Exception as e:
@@ -940,7 +940,7 @@ class RiskManager:
     @staticmethod
     async def calculate(
         signal: Signal,
-        adapter: CapitalAdapter,
+        adapter: BrokerAdapter,
         config: BotConfig,
         ind: dict,
     ) -> tuple[bool, str, Optional[dict]]:
@@ -1012,7 +1012,7 @@ class RiskManager:
 
 class OrderExecutor:
     @staticmethod
-    async def execute(signal: Signal, adapter: CapitalAdapter, risk_params: dict, config: BotConfig, db: AsyncSession) -> tuple[bool, str, Optional[Trade]]:
+    async def execute(signal: Signal, adapter: BrokerAdapter, risk_params: dict, config: BotConfig, db: AsyncSession) -> tuple[bool, str, Optional[Trade]]:
         deal_ref = await adapter.place_order(
             symbol      = signal.symbol,
             side        = signal.side.value,
@@ -1053,16 +1053,16 @@ class OrderExecutor:
 
 class TradingBot:
     def __init__(self):
-        self._adapter_cache: dict[str, CapitalAdapter] = {}
+        self._adapter_cache: dict[str, BrokerAdapter] = {}
 
-    async def _get_adapter(self, broker: BrokerAccount) -> Optional[CapitalAdapter]:
+    async def _get_adapter(self, broker: BrokerAccount) -> Optional[BrokerAdapter]:
         if broker.id in self._adapter_cache:
             adapter = self._adapter_cache[broker.id]
             if await adapter.is_connected():
                 return adapter
             await adapter.disconnect()
             del self._adapter_cache[broker.id]
-        adapter = CapitalAdapter(broker)
+        adapter = get_broker_adapter(broker)
         if not await adapter.connect():
             logger.error(f"Failed to connect to broker {broker.name}")
             return None
@@ -1177,7 +1177,7 @@ class TradingBot:
         db: AsyncSession,
         config: BotConfig,
         broker: BrokerAccount,
-        adapter: CapitalAdapter,
+        adapter: BrokerAdapter,
         symbol: str,
         ctx: ScanContext,
         strategy: Strategy,

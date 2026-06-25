@@ -266,4 +266,9 @@ def get_broker_adapter(account: BrokerAccount) -> BrokerAdapter:
         from brokers.capital_adapter import CapitalAdapter
         return CapitalAdapter(account)
 
+    # IG Markets CFD broker
+    if broker_type in ["ig", "ig_markets", "ig.com"]:
+        from brokers.ig_adapter import IGAdapter
+        return IGAdapter(account)
+
     raise ValueError(f"Unsupported broker type: {broker_type}")

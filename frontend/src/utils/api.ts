@@ -86,6 +86,7 @@ export const brokersApi = {
   add: (data: object) => api.post("/brokers", data),
   remove: (id: string) => api.delete(`/brokers/${id}`),
   test: (id: string) => api.post(`/brokers/${id}/test`),
+  toggle: (id: string) => api.post(`/brokers/${id}/toggle`),
 };
 
 export const reportsApi = {
