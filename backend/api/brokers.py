@@ -53,6 +53,35 @@ async def remove_broker(broker_id: str, user: User = Depends(get_current_user), 
     await db.commit()
 
 
+class BrokerUpdate(BaseModel):
+    name: Optional[str] = None
+    api_key: Optional[str] = None
+    api_secret: Optional[str] = None
+    extra: Optional[str] = None
+
+
+@router.put("/{broker_id}")
+async def update_broker(broker_id: str, body: BrokerUpdate, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    r = await db.execute(select(BrokerAccount).where(BrokerAccount.id == broker_id, BrokerAccount.user_id == user.id))
+    broker = r.scalar_one_or_none()
+    if not broker:
+        raise HTTPException(404, "Broker not found")
+
+    if body.name:
+        broker.name = body.name
+    if body.api_key:
+        broker.encrypted_api_key = encrypt_credential(body.api_key)
+    if body.api_secret:
+        broker.encrypted_api_secret = encrypt_credential(body.api_secret)
+    if body.extra:
+        broker.encrypted_extra = encrypt_credential(body.extra)
+
+    broker.is_connected = False  # yeni bilgilerle tekrar test edilmeli
+    await db.commit()
+    await db.refresh(broker)
+    return _serialize(broker)
+
+
 @router.post("/{broker_id}/toggle")
 async def toggle_broker(broker_id: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     """Broker'ı aktif/deaktif et. Aktif edince diğerleri deaktif olur."""

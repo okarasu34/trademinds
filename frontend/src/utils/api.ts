@@ -84,6 +84,7 @@ export const strategiesApi = {
 export const brokersApi = {
   list: () => api.get("/brokers"),
   add: (data: object) => api.post("/brokers", data),
+  update: (id: string, data: object) => api.put(`/brokers/${id}`, data),
   remove: (id: string) => api.delete(`/brokers/${id}`),
   test: (id: string) => api.post(`/brokers/${id}/test`),
   toggle: (id: string) => api.post(`/brokers/${id}/toggle`),

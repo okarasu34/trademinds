@@ -688,8 +688,10 @@ function BrokersPanel() {
   const [brokers, setBrokers] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [showAdd, setShowAdd] = useState(false);
+  const [editing, setEditing] = useState<string | null>(null);
   const [testing, setTesting] = useState<string | null>(null);
   const [form, setForm] = useState({ name: "", broker_type: "capital", api_key: "", api_secret: "", extra: "", market_type: "MULTI" });
+  const [editForm, setEditForm] = useState({ name: "", api_key: "", api_secret: "", extra: "" });
 
   useEffect(() => {
     loadBrokers();
@@ -740,6 +742,28 @@ function BrokersPanel() {
     }
   };
 
+  const startEdit = (b: any) => {
+    setEditing(b.id);
+    setEditForm({ name: b.name, api_key: "", api_secret: "", extra: "" });
+  };
+
+  const saveEdit = async (id: string) => {
+    try {
+      const { brokersApi } = await import("../utils/api");
+      const payload: any = {};
+      if (editForm.name) payload.name = editForm.name;
+      if (editForm.api_key) payload.api_key = editForm.api_key;
+      if (editForm.api_secret) payload.api_secret = editForm.api_secret;
+      if (editForm.extra) payload.extra = editForm.extra;
+      await brokersApi.update(id, payload);
+      toast.success("Broker updated! Test connection to verify.");
+      setEditing(null);
+      await loadBrokers();
+    } catch {
+      toast.error("Failed to update");
+    }
+  };
+
   const removeBroker = async (id: string) => {
     if (!confirm("Are you sure?")) return;
     try {
@@ -756,7 +780,6 @@ function BrokersPanel() {
 
   const brokerTypes: Record<string, string> = {
     capital: "Capital.com", ig: "IG Markets", ibkr: "Interactive Brokers",
-    binance: "Binance", bybit: "Bybit", mt5: "MetaTrader 5",
   };
 
   return (
@@ -776,30 +799,30 @@ function BrokersPanel() {
               <label style={{ fontSize: 11, color: "#64748b", display: "block", marginBottom: 4 }}>Name</label>
               <input value={form.name} onChange={e => setForm({ ...form, name: e.target.value })}
                 placeholder="e.g. IG Demo"
-                style={{ width: "100%", background: "#0d1421", border: "1px solid #1e2d45", borderRadius: 6, padding: "8px 10px", color: "#f1f5f9", fontSize: 13, outline: "none" }} />
+                style={{ width: "100%", background: "#0d1421", border: "1px solid #1e2d45", borderRadius: 6, padding: "8px 10px", color: "#f1f5f9", fontSize: 13, outline: "none", boxSizing: "border-box" }} />
             </div>
             <div>
               <label style={{ fontSize: 11, color: "#64748b", display: "block", marginBottom: 4 }}>Broker Type</label>
               <select value={form.broker_type} onChange={e => setForm({ ...form, broker_type: e.target.value })}
-                style={{ width: "100%", background: "#0d1421", border: "1px solid #1e2d45", borderRadius: 6, padding: "8px 10px", color: "#f1f5f9", fontSize: 13, outline: "none" }}>
+                style={{ width: "100%", background: "#0d1421", border: "1px solid #1e2d45", borderRadius: 6, padding: "8px 10px", color: "#f1f5f9", fontSize: 13, outline: "none", boxSizing: "border-box" }}>
                 {Object.entries(brokerTypes).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
               </select>
             </div>
             <div>
               <label style={{ fontSize: 11, color: "#64748b", display: "block", marginBottom: 4 }}>API Key</label>
               <input value={form.api_key} onChange={e => setForm({ ...form, api_key: e.target.value })}
-                style={{ width: "100%", background: "#0d1421", border: "1px solid #1e2d45", borderRadius: 6, padding: "8px 10px", color: "#f1f5f9", fontSize: 13, outline: "none" }} />
+                style={{ width: "100%", background: "#0d1421", border: "1px solid #1e2d45", borderRadius: 6, padding: "8px 10px", color: "#f1f5f9", fontSize: 13, outline: "none", boxSizing: "border-box" }} />
             </div>
             <div>
               <label style={{ fontSize: 11, color: "#64748b", display: "block", marginBottom: 4 }}>Password</label>
               <input type="password" value={form.api_secret} onChange={e => setForm({ ...form, api_secret: e.target.value })}
-                style={{ width: "100%", background: "#0d1421", border: "1px solid #1e2d45", borderRadius: 6, padding: "8px 10px", color: "#f1f5f9", fontSize: 13, outline: "none" }} />
+                style={{ width: "100%", background: "#0d1421", border: "1px solid #1e2d45", borderRadius: 6, padding: "8px 10px", color: "#f1f5f9", fontSize: 13, outline: "none", boxSizing: "border-box" }} />
             </div>
             <div style={{ gridColumn: "1 / -1" }}>
               <label style={{ fontSize: 11, color: "#64748b", display: "block", marginBottom: 4 }}>Email / Identifier (optional)</label>
               <input value={form.extra} onChange={e => setForm({ ...form, extra: e.target.value })}
                 placeholder="e.g. your@email.com"
-                style={{ width: "100%", background: "#0d1421", border: "1px solid #1e2d45", borderRadius: 6, padding: "8px 10px", color: "#f1f5f9", fontSize: 13, outline: "none" }} />
+                style={{ width: "100%", background: "#0d1421", border: "1px solid #1e2d45", borderRadius: 6, padding: "8px 10px", color: "#f1f5f9", fontSize: 13, outline: "none", boxSizing: "border-box" }} />
             </div>
           </div>
           <button onClick={addBroker}
@@ -836,16 +859,62 @@ function BrokersPanel() {
               </div>
               <div style={{ background: "#0d1421", borderRadius: 6, padding: "8px 10px" }}>
                 <div style={{ fontSize: 10, color: "#64748b" }}>Status</div>
-                <div style={{ fontSize: 14, fontWeight: 700, color: b.is_connected ? "#10b981" : "#64748b" }}>
+                <div style={{ fontSize: 14, fontWeight: 700, color: b.is_connected ? "#10b981" : "#ef4444" }}>
                   {b.is_connected ? "Connected" : "Disconnected"}
                 </div>
               </div>
             </div>
 
+            {/* Edit Form */}
+            {editing === b.id && (
+              <div style={{ background: "#0d1421", borderRadius: 8, padding: 14, marginBottom: 12, border: "1px solid #1e2d45" }}>
+                <div style={{ fontSize: 12, fontWeight: 600, color: "#60a5fa", marginBottom: 10 }}>Edit Credentials</div>
+                <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                  <div>
+                    <label style={{ fontSize: 10, color: "#64748b" }}>Name</label>
+                    <input value={editForm.name} onChange={e => setEditForm({ ...editForm, name: e.target.value })}
+                      style={{ width: "100%", background: "#111827", border: "1px solid #1e2d45", borderRadius: 4, padding: "6px 8px", color: "#f1f5f9", fontSize: 12, outline: "none", boxSizing: "border-box" }} />
+                  </div>
+                  <div>
+                    <label style={{ fontSize: 10, color: "#64748b" }}>New API Key</label>
+                    <input value={editForm.api_key} onChange={e => setEditForm({ ...editForm, api_key: e.target.value })}
+                      placeholder="Leave empty to keep current"
+                      style={{ width: "100%", background: "#111827", border: "1px solid #1e2d45", borderRadius: 4, padding: "6px 8px", color: "#f1f5f9", fontSize: 12, outline: "none", boxSizing: "border-box" }} />
+                  </div>
+                  <div>
+                    <label style={{ fontSize: 10, color: "#64748b" }}>New Password</label>
+                    <input type="password" value={editForm.api_secret} onChange={e => setEditForm({ ...editForm, api_secret: e.target.value })}
+                      placeholder="Leave empty to keep current"
+                      style={{ width: "100%", background: "#111827", border: "1px solid #1e2d45", borderRadius: 4, padding: "6px 8px", color: "#f1f5f9", fontSize: 12, outline: "none", boxSizing: "border-box" }} />
+                  </div>
+                  <div>
+                    <label style={{ fontSize: 10, color: "#64748b" }}>New Email / Identifier</label>
+                    <input value={editForm.extra} onChange={e => setEditForm({ ...editForm, extra: e.target.value })}
+                      placeholder="Leave empty to keep current"
+                      style={{ width: "100%", background: "#111827", border: "1px solid #1e2d45", borderRadius: 4, padding: "6px 8px", color: "#f1f5f9", fontSize: 12, outline: "none", boxSizing: "border-box" }} />
+                  </div>
+                  <div style={{ display: "flex", gap: 8, marginTop: 4 }}>
+                    <button onClick={() => saveEdit(b.id)}
+                      style={{ flex: 1, background: "#10b981", color: "white", border: "none", borderRadius: 4, padding: "7px", fontSize: 12, fontWeight: 600, cursor: "pointer" }}>
+                      Save
+                    </button>
+                    <button onClick={() => setEditing(null)}
+                      style={{ flex: 1, background: "#1e2d45", color: "#94a3b8", border: "none", borderRadius: 4, padding: "7px", fontSize: 12, cursor: "pointer" }}>
+                      Cancel
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
+
             <div style={{ display: "flex", gap: 8 }}>
               <button onClick={() => testBroker(b.id)} disabled={testing === b.id}
                 style={{ flex: 1, background: "#1e2d45", color: "#60a5fa", border: "none", borderRadius: 6, padding: "8px", fontSize: 12, fontWeight: 600, cursor: "pointer", opacity: testing === b.id ? 0.5 : 1 }}>
                 {testing === b.id ? "Testing..." : "Test Connection"}
+              </button>
+              <button onClick={() => startEdit(b)}
+                style={{ background: "#1e2d45", color: "#fbbf24", border: "none", borderRadius: 6, padding: "8px 12px", fontSize: 12, cursor: "pointer" }}>
+                ✎
               </button>
               <button onClick={() => removeBroker(b.id)}
                 style={{ background: "#1e2d45", color: "#f87171", border: "none", borderRadius: 6, padding: "8px 12px", fontSize: 12, cursor: "pointer" }}>
