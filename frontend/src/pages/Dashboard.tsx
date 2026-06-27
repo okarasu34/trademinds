@@ -780,7 +780,8 @@ function BrokersPanel() {
 
   const brokerTypes: Record<string, string> = {
     capital: "Capital.com", ig: "IG Markets", ibkr: "Interactive Brokers",
-  };
+    mt5: "MetaTrader 5",
+};
 
   return (
     <div style={{ padding: 24 }}>
