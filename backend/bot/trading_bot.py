@@ -83,6 +83,8 @@ class ScanContext:
     open_symbols: set = field(default_factory=set)
     open_count: int = 0
     market_counts: dict = field(default_factory=dict)
+    # Korelasyon takibi: "USD_long", "USD_short", "EUR_long" vb. → pozisyon sayısı
+    correlation_counts: dict = field(default_factory=dict)
 
 
 # ─────────────────────── STRATEJI SINIFLAR ───────────────────────
@@ -846,12 +848,53 @@ class PositionGuard:
                 return False, f"Market limit reached: {market_key} {current}/{market_limit}"
         return True, "OK"
 
+    # ── Korelasyon kontrolü ──────────────────────────────────────────
+    # Forex çiftlerinde aynı dövize bağlı pozisyonları sınırlar.
+    # Örnek: EUR/USD BUY + GBP/USD BUY + USD/CHF SELL = hepsi "USD short"
+    # MAX_CORR_POSITIONS aşılınca yeni pozisyon reddedilir.
+    MAX_CORR_POSITIONS = 2
+
+    # Para birimi → korelasyon grubu (hangi yönde USD exposure üretir)
+    _QUOTE_CURRENCIES = {"USD", "EUR", "GBP", "JPY", "CHF", "AUD", "NZD", "CAD"}
+
+    @staticmethod
+    def _corr_keys(symbol: str, side: "OrderSide") -> list[str]:
+        """
+        6 karakterli forex sembolu için hangi korelasyon gruplarına girdiğini döner.
+        EUR/USD BUY → ["EUR_long", "USD_short"]
+        EUR/USD SELL → ["EUR_short", "USD_long"]
+        Forex dışı semboller için boş liste döner.
+        """
+        s = symbol.upper().replace("/", "").replace("_", "")
+        if len(s) != 6 or not s.isalpha():
+            return []
+        base, quote = s[:3], s[3:]
+        if base not in PositionGuard._QUOTE_CURRENCIES or quote not in PositionGuard._QUOTE_CURRENCIES:
+            return []
+        is_buy = side.value.upper() == "BUY"
+        return [
+            f"{base}_{'long' if is_buy else 'short'}",
+            f"{quote}_{'short' if is_buy else 'long'}",
+        ]
+
+    @staticmethod
+    def check_correlation(signal: "Signal", ctx: ScanContext) -> tuple[bool, str]:
+        keys = PositionGuard._corr_keys(signal.symbol, signal.side)
+        for key in keys:
+            count = ctx.correlation_counts.get(key, 0)
+            if count >= PositionGuard.MAX_CORR_POSITIONS:
+                return False, f"Korelasyon limiti: {key} {count}/{PositionGuard.MAX_CORR_POSITIONS}"
+        return True, "OK"
+
     @staticmethod
     def register_open(signal: Signal, ctx: ScanContext):
         ctx.open_symbols.add(signal.symbol)
         ctx.open_count += 1
         market_key = signal.market_type.value
         ctx.market_counts[market_key] = ctx.market_counts.get(market_key, 0) + 1
+        # Korelasyon sayaçlarını güncelle
+        for key in PositionGuard._corr_keys(signal.symbol, signal.side):
+            ctx.correlation_counts[key] = ctx.correlation_counts.get(key, 0) + 1
 
     @staticmethod
     def _infer_market(symbol: str) -> str:
@@ -1146,10 +1189,13 @@ class TradingBot:
             open_symbols  = {p.symbol for p in live_positions},
             open_count    = len(live_positions),
             market_counts = {},
+            correlation_counts = {},
         )
         for p in live_positions:
             mk = PositionGuard._infer_market(p.symbol)
             ctx.market_counts[mk] = ctx.market_counts.get(mk, 0) + 1
+            for key in PositionGuard._corr_keys(p.symbol, p.side):
+                ctx.correlation_counts[key] = ctx.correlation_counts.get(key, 0) + 1
 
         try:
             redis_ordered = await OrderedSymbolCache.get_all_ordered(config.user_id, symbols)
@@ -1344,6 +1390,11 @@ class TradingBot:
             return
 
         # 7. Position Guard
+        ok, msg = PositionGuard.check_correlation(signal, ctx)
+        if not ok:
+            logger.info(f"[{symbol}] REJECTED by CorrelationGuard: {msg}")
+            return
+
         ok, msg = PositionGuard.check(signal, ctx, config)
         if not ok:
             logger.info(f"[{symbol}] REJECTED at PositionGuard: {msg}")
