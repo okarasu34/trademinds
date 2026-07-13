@@ -185,8 +185,8 @@ async def get_watchlist_symbols(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Returns cached watchlist symbols from active broker adapter."""
-    from brokers.base_adapter import get_broker_adapter
+    """Returns watchlist symbols from active broker."""
+    from brokers.capital_adapter import CapitalAdapter
     broker_result = await db.execute(
         select(BrokerAccount).where(
             BrokerAccount.user_id == user.id,
@@ -197,8 +197,11 @@ async def get_watchlist_symbols(
     if not broker:
         return {"symbols": []}
     try:
-        adapter = await get_broker_adapter(broker)
-        symbols = adapter.get_cached_watchlist_symbols()
+        adapter = CapitalAdapter(broker)
+        await adapter.connect()
+        await adapter.load_trademinds_watchlist()
+        symbols = adapter._cached_watchlist_symbols or []
+        await adapter.disconnect()
         return {"symbols": sorted(symbols)}
     except Exception as e:
         return {"symbols": []}
