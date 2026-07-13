@@ -107,4 +107,15 @@ export const dashboardApi = {
   getSummary: () => api.get("/dashboard/summary"),
 };
 
+export const backtestsApi = {
+  list: () => api.get("/backtests"),
+  create: (data: object) => api.post("/backtests", data),
+  get: (id: string) => api.get(`/backtests/${id}`),
+  delete: (id: string) => api.delete(`/backtests/${id}`),
+};
+
+export const botSymbolsApi = {
+  list: () => api.get("/bot/symbols"),
+};
+
 export default api;

@@ -949,37 +949,42 @@ function BrokersPanel() {
 function BacktestPanel() {
   const C = { bg: "#0a0f1a", card: "#0d1526", border: "#1e2d45", text: "#f1f5f9", muted: "#64748b", accent: "#3b82f6", green: "#10b981", red: "#f87171", yellow: "#fbbf24" };
   const [strategies, setStrategies] = useState<any[]>([]);
+  const [symbols, setSymbols] = useState<string[]>([]);
   const [backtests, setBacktests] = useState<any[]>([]);
   const [loading, setLoading] = useState(false);
   const [running, setRunning] = useState(false);
-  const [form, setForm] = useState({ name: "", strategy_id: "", symbol: "EURUSD", timeframe: "1h", start_date: "", end_date: "", initial_balance: 10000 });
+  const [form, setForm] = useState({ name: "", strategy_id: "", symbol: "", timeframe: "1h", start_date: "", end_date: "", initial_balance: 10000 });
   const [selected, setSelected] = useState<any>(null);
-  const token = useAuthStore(s => s.accessToken);
-
-  const api = (path: string, opts?: any) =>
-    fetch(`/api/v1${path}`, { headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, ...opts });
-
   useEffect(() => {
-    api("/strategies").then(r => r.json()).then(d => setStrategies(Array.isArray(d) ? d : [])).catch(() => {});
-    loadBacktests();
+    import("../utils/api").then(({ strategiesApi, backtestsApi: btApi, botSymbolsApi }) => {
+      strategiesApi.list().then((r: any) => setStrategies(Array.isArray(r.data) ? r.data : [])).catch(() => {});
+      btApi.list().then((r: any) => setBacktests(Array.isArray(r.data) ? r.data : [])).catch(() => {});
+      botSymbolsApi.list().then((r: any) => {
+        const list = Array.isArray(r.data?.symbols) ? r.data.symbols : [];
+        setSymbols(list);
+        if (list.length > 0) setForm(f => ({ ...f, symbol: list[0] }));
+      }).catch(() => {});
+    });
   }, []);
 
   const loadBacktests = () => {
-    api("/backtests").then(r => r.json()).then(d => setBacktests(Array.isArray(d) ? d : [])).catch(() => {});
+    import("../utils/api").then(({ backtestsApi: btApi }) => {
+      btApi.list().then((r: any) => setBacktests(Array.isArray(r.data) ? r.data : [])).catch(() => {});
+    });
   };
 
   const run = async () => {
     if (!form.strategy_id || !form.start_date || !form.end_date) { alert("Strateji, başlangıç ve bitiş tarihi gerekli"); return; }
     setRunning(true);
     try {
-      const r = await api("/backtests", { method: "POST", body: JSON.stringify({ ...form, initial_balance: Number(form.initial_balance), start_date: new Date(form.start_date).toISOString(), end_date: new Date(form.end_date).toISOString() }) });
-      const d = await r.json();
+      const { backtestsApi: btApi } = await import("../utils/api");
+      const r = await btApi.create({ ...form, initial_balance: Number(form.initial_balance), start_date: new Date(form.start_date).toISOString(), end_date: new Date(form.end_date).toISOString() });
+      const d = r.data;
       if (d.id) {
         loadBacktests();
-        // Poll until complete
         const poll = setInterval(async () => {
-          const res = await api(`/backtests/${d.id}`);
-          const bt = await res.json();
+          const res = await btApi.get(d.id);
+          const bt = res.data;
           if (bt.status === "completed" || bt.status === "failed") {
             clearInterval(poll);
             setRunning(false);
@@ -1018,7 +1023,14 @@ function BacktestPanel() {
                 {strategies.map((s: any) => <option key={s.id} value={s.id}>{s.name}</option>)}
               </select>
             </div>
-            {inp("Sembol", "symbol")}
+            <div>
+              <div style={{ fontSize: 10, color: C.muted, marginBottom: 3 }}>Sembol</div>
+              <select value={form.symbol} onChange={e => setForm({ ...form, symbol: e.target.value })}
+                style={{ width: "100%", background: "#111827", border: `1px solid ${C.border}`, borderRadius: 4, padding: "6px 8px", color: C.text, fontSize: 12, outline: "none" }}>
+                {symbols.length === 0 && <option value="">Yükleniyor...</option>}
+                {symbols.map(s => <option key={s} value={s}>{s}</option>)}
+              </select>
+            </div>
             <div>
               <div style={{ fontSize: 10, color: C.muted, marginBottom: 3 }}>Timeframe</div>
               <select value={form.timeframe} onChange={e => setForm({ ...form, timeframe: e.target.value })}

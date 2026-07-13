@@ -180,7 +180,28 @@ async def get_health_logs(
     ]
 
 
-@router.post("/reset-daily")
+@router.get("/symbols")
+async def get_watchlist_symbols(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Returns cached watchlist symbols from active broker adapter."""
+    from brokers.base_adapter import get_broker_adapter
+    broker_result = await db.execute(
+        select(BrokerAccount).where(
+            BrokerAccount.user_id == user.id,
+            BrokerAccount.is_active == True,
+        )
+    )
+    broker = broker_result.scalars().first()
+    if not broker:
+        return {"symbols": []}
+    try:
+        adapter = await get_broker_adapter(broker)
+        symbols = adapter.get_cached_watchlist_symbols()
+        return {"symbols": sorted(symbols)}
+    except Exception as e:
+        return {"symbols": []}
 async def reset_daily_stats(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
