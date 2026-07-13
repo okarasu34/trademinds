@@ -6,13 +6,14 @@ Pipeline (her strateji için):
   2. EMA200 + EMA50 trend filtresi
   3. RSI aralık filtresi (35-65)
   4. MACD teyidi
-  5. ★ News Guard (high-impact haber varsa sembolü atla)
-  6. ★ News Sentiment Boost (actual vs forecast → confidence ayarla)
-  7. Signal Validator (idempotency)
-  8. Position Guard
-  9. ★ Margin Guard (toplam margin %10'u geçerse dur)
-  10. Risk Manager (ATR bazlı SL/TP)
-  11. Order Executor
+  5. ★ Multi-Timeframe Teyit (1H + 4H + 1D trend uyumu → confidence ayarla)
+  6. ★ News Guard (high-impact haber varsa sembolü atla)
+  7. ★ News Sentiment Boost (actual vs forecast → confidence ayarla)
+  8. Signal Validator (idempotency)
+  9. Position Guard
+  10. ★ Margin Guard (toplam margin %10'u geçerse dur)
+  11. Risk Manager (ATR bazlı SL/TP)
+  12. Order Executor
 """
 import asyncio
 import hashlib
@@ -32,6 +33,7 @@ from db.models import (
 from db.redis_client import cache_set, cache_get
 from brokers.base_adapter import BrokerAdapter, get_broker_adapter
 from bot.indicators import calculate_indicators
+from bot.multi_timeframe import MultiTimeframeAnalyzer, MTFMode, MTFAction
 from data.calendar import calendar_client
 from core.config import settings
 
@@ -1285,7 +1287,32 @@ class TradingBot:
         if filter_notes:
             signal.reasoning += f" | Filters:[{' '.join(filter_notes)}]"
 
-        # ★ 4. NEWS GUARD — High-impact haber filtresi
+        # ★ 4. MULTI-TIMEFRAME TEYIT (1H sinyali + 4H + 1D trend)
+        mtf = MultiTimeframeAnalyzer(mode=MTFMode.SOFT)
+        try:
+            mtf_result = await mtf.confirm(
+                symbol=symbol,
+                signal_side=signal.side.value,
+                base_confidence=signal.confidence,
+                fetch_candles=lambda sym, tf, cnt: adapter.get_candles(sym, tf.lower(), limit=cnt),
+            )
+            if mtf_result.action == MTFAction.SKIP:
+                logger.info(f"[{symbol}] REJECTED by MTF: {mtf_result.reason}")
+                return
+            if mtf_result.adjusted_confidence != signal.confidence:
+                logger.info(
+                    f"[{symbol}] MTF: conf {signal.confidence:.2f} → {mtf_result.adjusted_confidence:.2f} "
+                    f"| 4H={mtf_result.trend_4h} 1D={mtf_result.trend_1d} | {mtf_result.reason}"
+                )
+                signal.confidence = mtf_result.adjusted_confidence
+                signal.reasoning += f" | MTF:{mtf_result.reason}"
+            if signal.confidence < MIN_CONFIDENCE:
+                logger.info(f"[{symbol}] REJECTED by MTF confidence: {signal.confidence:.2f} < {MIN_CONFIDENCE}")
+                return
+        except Exception as e:
+            logger.warning(f"[{symbol}] MTF check failed, skipping: {e}")
+
+        # ★ 5. NEWS GUARD — High-impact haber filtresi
         ok, msg, news_events = await NewsGuard.check(symbol)
         if not ok:
             logger.warning(f"[{symbol}] SKIPPED by {msg}")
