@@ -54,6 +54,7 @@ const TABS = [
   { id: "history", label: "History", icon: "📋" },
   { id: "strategies", label: "Strategies", icon: "🧠" },
   { id: "brokers", label: "Brokers", icon: "🔗" },
+  { id: "backtest", label: "Backtest", icon: "🧪" },
   { id: "calendar", label: "Calendar", icon: "📅" },
   { id: "settings", label: "Settings", icon: "⚙️" },
 ];
@@ -530,6 +531,9 @@ export default function Dashboard() {
         {tab === "strategies" && <StrategiesPanel />}
         {tab === "brokers" && <BrokersPanel />}
 
+        {/* ── Backtest Tab ── */}
+        {tab === "backtest" && <BacktestPanel />}
+
         {/* Loading state */}
         {!s && tab === "dashboard" && (
           <div style={{ padding: 40, textAlign: "center", color: C.muted }}>Loading...</div>
@@ -937,6 +941,199 @@ function BrokersPanel() {
           No brokers configured. Click "+ Add Broker" to get started.
         </div>
       )}
+    </div>
+  );
+}
+
+// ─────────────────────────── BACKTEST PANEL ───────────────────────────
+function BacktestPanel() {
+  const C = { bg: "#0a0f1a", card: "#0d1526", border: "#1e2d45", text: "#f1f5f9", muted: "#64748b", accent: "#3b82f6", green: "#10b981", red: "#f87171", yellow: "#fbbf24" };
+  const [strategies, setStrategies] = useState<any[]>([]);
+  const [backtests, setBacktests] = useState<any[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [running, setRunning] = useState(false);
+  const [form, setForm] = useState({ name: "", strategy_id: "", symbol: "EURUSD", timeframe: "1h", start_date: "", end_date: "", initial_balance: 10000 });
+  const [selected, setSelected] = useState<any>(null);
+  const token = useAuthStore(s => s.accessToken);
+
+  const api = (path: string, opts?: any) =>
+    fetch(`/api/v1${path}`, { headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, ...opts });
+
+  useEffect(() => {
+    api("/strategies").then(r => r.json()).then(d => setStrategies(Array.isArray(d) ? d : [])).catch(() => {});
+    loadBacktests();
+  }, []);
+
+  const loadBacktests = () => {
+    api("/backtests").then(r => r.json()).then(d => setBacktests(Array.isArray(d) ? d : [])).catch(() => {});
+  };
+
+  const run = async () => {
+    if (!form.strategy_id || !form.start_date || !form.end_date) { alert("Strateji, başlangıç ve bitiş tarihi gerekli"); return; }
+    setRunning(true);
+    try {
+      const r = await api("/backtests", { method: "POST", body: JSON.stringify({ ...form, initial_balance: Number(form.initial_balance), start_date: new Date(form.start_date).toISOString(), end_date: new Date(form.end_date).toISOString() }) });
+      const d = await r.json();
+      if (d.id) {
+        loadBacktests();
+        // Poll until complete
+        const poll = setInterval(async () => {
+          const res = await api(`/backtests/${d.id}`);
+          const bt = await res.json();
+          if (bt.status === "completed" || bt.status === "failed") {
+            clearInterval(poll);
+            setRunning(false);
+            loadBacktests();
+            if (bt.status === "completed") setSelected(bt);
+          }
+        }, 3000);
+      } else { setRunning(false); alert(d.detail || "Hata"); }
+    } catch { setRunning(false); alert("Bağlantı hatası"); }
+  };
+
+  const inp = (label: string, key: string, type = "text", extra?: any) => (
+    <div>
+      <div style={{ fontSize: 10, color: C.muted, marginBottom: 3 }}>{label}</div>
+      <input type={type} value={(form as any)[key]} onChange={e => setForm({ ...form, [key]: e.target.value })} {...extra}
+        style={{ width: "100%", background: "#111827", border: `1px solid ${C.border}`, borderRadius: 4, padding: "6px 8px", color: C.text, fontSize: 12, outline: "none", boxSizing: "border-box" as any }} />
+    </div>
+  );
+
+  const statusColor = (s: string) => s === "completed" ? C.green : s === "failed" ? C.red : s === "running" ? C.yellow : C.muted;
+
+  return (
+    <div style={{ display: "grid", gridTemplateColumns: "300px 1fr", gap: 16, height: "100%" }}>
+      {/* Left: Form + List */}
+      <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+        {/* New Backtest Form */}
+        <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 8, padding: 14 }}>
+          <div style={{ fontSize: 12, fontWeight: 700, color: C.text, marginBottom: 12 }}>🧪 Yeni Backtest</div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {inp("İsim", "name")}
+            <div>
+              <div style={{ fontSize: 10, color: C.muted, marginBottom: 3 }}>Strateji</div>
+              <select value={form.strategy_id} onChange={e => setForm({ ...form, strategy_id: e.target.value })}
+                style={{ width: "100%", background: "#111827", border: `1px solid ${C.border}`, borderRadius: 4, padding: "6px 8px", color: C.text, fontSize: 12, outline: "none" }}>
+                <option value="">Seç...</option>
+                {strategies.map((s: any) => <option key={s.id} value={s.id}>{s.name}</option>)}
+              </select>
+            </div>
+            {inp("Sembol", "symbol")}
+            <div>
+              <div style={{ fontSize: 10, color: C.muted, marginBottom: 3 }}>Timeframe</div>
+              <select value={form.timeframe} onChange={e => setForm({ ...form, timeframe: e.target.value })}
+                style={{ width: "100%", background: "#111827", border: `1px solid ${C.border}`, borderRadius: 4, padding: "6px 8px", color: C.text, fontSize: 12, outline: "none" }}>
+                {["1h","4h","1d"].map(tf => <option key={tf} value={tf}>{tf}</option>)}
+              </select>
+            </div>
+            {inp("Başlangıç Tarihi", "start_date", "date")}
+            {inp("Bitiş Tarihi", "end_date", "date")}
+            {inp("Başlangıç Bakiyesi (EUR)", "initial_balance", "number")}
+            <button onClick={run} disabled={running}
+              style={{ background: running ? C.muted : C.accent, color: "white", border: "none", borderRadius: 6, padding: "9px", fontSize: 12, fontWeight: 700, cursor: running ? "not-allowed" : "pointer", marginTop: 4 }}>
+              {running ? "⏳ Çalışıyor..." : "▶ Çalıştır"}
+            </button>
+          </div>
+        </div>
+
+        {/* Backtest List */}
+        <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 8, padding: 14, flex: 1, overflowY: "auto" as any }}>
+          <div style={{ fontSize: 12, fontWeight: 700, color: C.text, marginBottom: 10 }}>Geçmiş Testler</div>
+          {backtests.length === 0 && <div style={{ color: C.muted, fontSize: 11 }}>Henüz test yok</div>}
+          {backtests.map((b: any) => (
+            <div key={b.id} onClick={() => setSelected(b)} style={{ padding: "8px 10px", marginBottom: 6, borderRadius: 6, border: `1px solid ${selected?.id === b.id ? C.accent : C.border}`, cursor: "pointer", background: selected?.id === b.id ? "#111827" : "transparent" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <div style={{ fontSize: 11, fontWeight: 600, color: C.text }}>{b.name || b.symbol}</div>
+                <div style={{ fontSize: 10, color: statusColor(b.status) }}>{b.status}</div>
+              </div>
+              <div style={{ fontSize: 10, color: C.muted, marginTop: 2 }}>{b.symbol} · {b.timeframe}</div>
+              {b.status === "completed" && (
+                <div style={{ fontSize: 10, marginTop: 4, color: (b.total_return_pct ?? 0) >= 0 ? C.green : C.red }}>
+                  {(b.total_return_pct ?? 0) >= 0 ? "+" : ""}{b.total_return_pct?.toFixed(2)}% · WR: {b.win_rate?.toFixed(1)}%
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Right: Results */}
+      <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 8, padding: 16, overflowY: "auto" as any }}>
+        {!selected && <div style={{ color: C.muted, fontSize: 12, textAlign: "center", marginTop: 40 }}>Sonuçları görmek için bir test seçin</div>}
+        {selected && selected.status === "failed" && <div style={{ color: C.red, fontSize: 12 }}>❌ Hata: {selected.error_message}</div>}
+        {selected && selected.status === "completed" && (
+          <>
+            <div style={{ fontSize: 13, fontWeight: 700, color: C.text, marginBottom: 14 }}>{selected.name} — {selected.symbol} {selected.timeframe}</div>
+
+            {/* Stats Grid */}
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 10, marginBottom: 16 }}>
+              {[
+                { label: "Net Getiri", value: `${(selected.total_return_pct ?? 0) >= 0 ? "+" : ""}${selected.total_return_pct?.toFixed(2)}%`, color: (selected.total_return_pct ?? 0) >= 0 ? C.green : C.red },
+                { label: "Win Rate", value: `${selected.win_rate?.toFixed(1)}%`, color: C.text },
+                { label: "Toplam Trade", value: selected.total_trades, color: C.text },
+                { label: "Kazanan / Kaybeden", value: `${selected.winning_trades} / ${selected.losing_trades}`, color: C.text },
+                { label: "Max Drawdown", value: `${selected.max_drawdown_pct?.toFixed(2)}%`, color: C.red },
+                { label: "Sharpe Ratio", value: selected.sharpe_ratio?.toFixed(2), color: C.text },
+                { label: "Profit Factor", value: selected.profit_factor?.toFixed(2), color: (selected.profit_factor ?? 0) >= 1 ? C.green : C.red },
+                { label: "Final Bakiye", value: `${selected.final_balance?.toFixed(2)} EUR`, color: C.text },
+              ].map((s: any) => (
+                <div key={s.label} style={{ background: "#111827", borderRadius: 6, padding: "10px 12px", border: `1px solid ${C.border}` }}>
+                  <div style={{ fontSize: 10, color: C.muted, marginBottom: 4 }}>{s.label}</div>
+                  <div style={{ fontSize: 14, fontWeight: 700, color: s.color }}>{s.value}</div>
+                </div>
+              ))}
+            </div>
+
+            {/* Equity Curve */}
+            {selected.equity_curve && selected.equity_curve.length > 0 && (
+              <div style={{ marginBottom: 16 }}>
+                <div style={{ fontSize: 11, fontWeight: 600, color: C.text, marginBottom: 8 }}>Equity Curve</div>
+                <div style={{ height: 120, background: "#111827", borderRadius: 6, border: `1px solid ${C.border}`, position: "relative", overflow: "hidden" }}>
+                  <svg width="100%" height="100%" viewBox={`0 0 ${selected.equity_curve.length} 100`} preserveAspectRatio="none">
+                    {(() => {
+                      const vals: number[] = selected.equity_curve;
+                      const min = Math.min(...vals), max = Math.max(...vals), range = max - min || 1;
+                      const pts = vals.map((v: number, i: number) => `${i},${100 - ((v - min) / range) * 90 - 5}`).join(" ");
+                      const color = vals[vals.length - 1] >= vals[0] ? "#10b981" : "#f87171";
+                      return <polyline points={pts} fill="none" stroke={color} strokeWidth="0.8" />;
+                    })()}
+                  </svg>
+                </div>
+              </div>
+            )}
+
+            {/* Trade Log */}
+            {selected.trade_log && selected.trade_log.length > 0 && (
+              <div>
+                <div style={{ fontSize: 11, fontWeight: 600, color: C.text, marginBottom: 8 }}>Trade Logu (ilk 50)</div>
+                <div style={{ overflowX: "auto" as any }}>
+                  <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 10 }}>
+                    <thead>
+                      <tr style={{ color: C.muted }}>
+                        {["Yön", "Giriş", "Çıkış", "PnL", "Süre (bar)", "HTF Trend"].map(h => (
+                          <th key={h} style={{ textAlign: "left", padding: "4px 8px", borderBottom: `1px solid ${C.border}` }}>{h}</th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {selected.trade_log.slice(0, 50).map((t: any, i: number) => (
+                        <tr key={i} style={{ borderBottom: `1px solid ${C.border}` }}>
+                          <td style={{ padding: "4px 8px", color: t.side === "buy" ? C.green : C.red }}>{t.side?.toUpperCase()}</td>
+                          <td style={{ padding: "4px 8px", color: C.text }}>{t.entry_price?.toFixed(5)}</td>
+                          <td style={{ padding: "4px 8px", color: C.text }}>{t.exit_price?.toFixed(5)}</td>
+                          <td style={{ padding: "4px 8px", color: t.pnl >= 0 ? C.green : C.red }}>{t.pnl >= 0 ? "+" : ""}{t.pnl?.toFixed(2)}</td>
+                          <td style={{ padding: "4px 8px", color: C.muted }}>{t.duration_bars}</td>
+                          <td style={{ padding: "4px 8px", color: C.muted }}>{t.htf_trend}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+          </>
+        )}
+      </div>
     </div>
   );
 }
