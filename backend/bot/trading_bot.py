@@ -871,7 +871,7 @@ class PositionGuard:
         base, quote = s[:3], s[3:]
         if base not in PositionGuard._QUOTE_CURRENCIES or quote not in PositionGuard._QUOTE_CURRENCIES:
             return []
-        is_buy = side.value.upper() == "BUY"
+        is_buy = (side.value if hasattr(side, 'value') else side).upper() == "BUY"
         return [
             f"{base}_{'long' if is_buy else 'short'}",
             f"{quote}_{'short' if is_buy else 'long'}",
