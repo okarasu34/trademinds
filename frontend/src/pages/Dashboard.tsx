@@ -5,8 +5,8 @@ import { useWebSocket } from "../hooks/useWebSocket";
 import toast from "react-hot-toast";
 
 const C = {
-  bg: "#080c14", surface: "#0d1421", card: "#111827",
-  border: "#1e2d45", accent: "#3b82f6", green: "#10b981",
+  bg: "#0f1f33", surface: "#162840", card: "#1a3248",
+  border: "#1e3a5f", accent: "#2dd4bf", green: "#2dd4bf",
   red: "#ef4444", yellow: "#f59e0b", purple: "#8b5cf6",
   text: "#f1f5f9", muted: "#64748b", dim: "#94a3b8",
 };
@@ -55,6 +55,7 @@ const TABS = [
   { id: "strategies", label: "Strategies", icon: "🧠" },
   { id: "brokers", label: "Brokers", icon: "🔗" },
   { id: "backtest", label: "Backtest", icon: "🧪" },
+  { id: "performance", label: "Performance", icon: "📈" },
   { id: "calendar", label: "Calendar", icon: "📅" },
   { id: "settings", label: "Settings", icon: "⚙️" },
 ];
@@ -533,6 +534,9 @@ export default function Dashboard() {
 
         {/* ── Backtest Tab ── */}
         {tab === "backtest" && <BacktestPanel />}
+
+        {/* ── Performance Tab ── */}
+        {tab === "performance" && <PerformancePanel />}
 
         {/* Loading state */}
         {!s && tab === "dashboard" && (
@@ -1146,6 +1150,145 @@ function BacktestPanel() {
           </>
         )}
       </div>
+    </div>
+  );
+}
+
+// ─────────────────────────── PERFORMANCE PANEL ───────────────────────────
+function PerformancePanel() {
+  const C = { card: "#1a3248", border: "#1e3a5f", text: "#e2e8f0", muted: "#64748b", accent: "#2dd4bf", green: "#2dd4bf", red: "#f87171", yellow: "#fbbf24", surface: "#162840" };
+  const [period, setPeriod] = useState("30d");
+  const [stats, setStats] = useState<any>(null);
+  const [curve, setCurve] = useState<any[]>([]);
+  const [breakdown, setBreakdown] = useState<any>({});
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    setLoading(true);
+    Promise.all([
+      tradesApi.getStats(period),
+      import("../utils/api").then(m => m.default.get("/dashboard/equity-curve", { params: { days: period === "7d" ? 7 : period === "30d" ? 30 : period === "90d" ? 90 : 365 } })),
+      import("../utils/api").then(m => m.default.get("/dashboard/market-breakdown")),
+    ]).then(([s, c, b]) => {
+      setStats(s.data);
+      setCurve(Array.isArray(c.data) ? c.data : []);
+      setBreakdown(b.data || {});
+      setLoading(false);
+    }).catch(() => setLoading(false));
+  }, [period]);
+
+  const statCard = (label: string, value: string | number, color = C.text) => (
+    <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 8, padding: "14px 16px" }}>
+      <div style={{ fontSize: 10, color: C.muted, letterSpacing: "0.06em", textTransform: "uppercase" as any, marginBottom: 6 }}>{label}</div>
+      <div style={{ fontSize: 20, fontWeight: 700, color }}>{value}</div>
+    </div>
+  );
+
+  const periods = ["7d", "30d", "90d", "1y"];
+
+  if (loading) return <div style={{ padding: 40, textAlign: "center", color: C.muted }}>Yükleniyor...</div>;
+
+  const pnls = curve.map((c: any) => c.pnl);
+  const cumulative = curve.map((c: any) => c.cumulative);
+  const maxCum = Math.max(...cumulative, 0);
+  const minCum = Math.min(...cumulative, 0);
+  const range = maxCum - minCum || 1;
+  const H = 140;
+
+  return (
+    <div style={{ padding: 24 }}>
+      {/* Period selector */}
+      <div style={{ display: "flex", gap: 8, marginBottom: 20 }}>
+        {periods.map(p => (
+          <button key={p} onClick={() => setPeriod(p)}
+            style={{ padding: "6px 16px", borderRadius: 6, border: `1px solid ${period === p ? C.accent : C.border}`, background: period === p ? C.accent + "22" : "transparent", color: period === p ? C.accent : C.muted, fontWeight: period === p ? 700 : 400, fontSize: 12, cursor: "pointer" }}>
+            {p}
+          </button>
+        ))}
+      </div>
+
+      {/* Stats grid */}
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 12, marginBottom: 20 }}>
+        {statCard("Toplam İşlem", stats?.total_trades ?? "-")}
+        {statCard("Win Rate", stats?.win_rate != null ? `${stats.win_rate.toFixed(1)}%` : "-", stats?.win_rate >= 50 ? C.green : C.red)}
+        {statCard("Net P&L", stats?.total_pnl != null ? `${stats.total_pnl >= 0 ? "+" : ""}${stats.total_pnl.toFixed(2)} EUR` : "-", stats?.total_pnl >= 0 ? C.green : C.red)}
+        {statCard("Profit Factor", stats?.profit_factor != null ? stats.profit_factor.toFixed(2) : "-", stats?.profit_factor >= 1 ? C.green : C.red)}
+        {statCard("Sharpe Ratio", stats?.sharpe_ratio != null ? stats.sharpe_ratio.toFixed(2) : "-")}
+        {statCard("Max Drawdown", stats?.max_drawdown != null ? `${stats.max_drawdown.toFixed(2)}%` : "-", C.red)}
+        {statCard("Kazanan", stats?.winning_trades ?? "-", C.green)}
+        {statCard("Kaybeden", stats?.losing_trades ?? "-", C.red)}
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr", gap: 16 }}>
+        {/* Equity Curve */}
+        <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 8, padding: 16 }}>
+          <div style={{ fontSize: 12, fontWeight: 700, color: C.text, marginBottom: 12 }}>Equity Curve</div>
+          {curve.length === 0
+            ? <div style={{ textAlign: "center", color: C.muted, fontSize: 12, padding: 40 }}>Bu dönemde işlem yok</div>
+            : (
+              <svg width="100%" height={H} viewBox={`0 0 ${curve.length} ${H}`} preserveAspectRatio="none">
+                {(() => {
+                  const pts = cumulative.map((v, i) => `${i},${H - ((v - minCum) / range) * (H - 10) - 5}`).join(" ");
+                  const last = cumulative[cumulative.length - 1] ?? 0;
+                  const color = last >= 0 ? "#2dd4bf" : "#f87171";
+                  return <>
+                    <polyline points={pts} fill="none" stroke={color} strokeWidth="1.2" />
+                    <line x1="0" y1={H - ((0 - minCum) / range) * (H - 10) - 5} x2={curve.length} y2={H - ((0 - minCum) / range) * (H - 10) - 5} stroke="#1e3a5f" strokeWidth="0.5" strokeDasharray="4,4" />
+                  </>;
+                })()}
+              </svg>
+            )
+          }
+          {curve.length > 0 && (
+            <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, color: C.muted, marginTop: 6 }}>
+              <span>{curve[0]?.date}</span>
+              <span>{curve[curve.length - 1]?.date}</span>
+            </div>
+          )}
+        </div>
+
+        {/* Market Breakdown */}
+        <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 8, padding: 16 }}>
+          <div style={{ fontSize: 12, fontWeight: 700, color: C.text, marginBottom: 12 }}>Market Bazlı</div>
+          {Object.keys(breakdown).length === 0
+            ? <div style={{ textAlign: "center", color: C.muted, fontSize: 12, padding: 20 }}>Veri yok</div>
+            : Object.entries(breakdown).map(([market, data]: [string, any]) => (
+              <div key={market} style={{ marginBottom: 12 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
+                  <span style={{ fontSize: 11, fontWeight: 600, color: C.text, textTransform: "uppercase" as any }}>{market}</span>
+                  <span style={{ fontSize: 11, color: data.pnl >= 0 ? C.green : C.red, fontWeight: 700 }}>
+                    {data.pnl >= 0 ? "+" : ""}{data.pnl.toFixed(2)}
+                  </span>
+                </div>
+                <div style={{ display: "flex", gap: 8, fontSize: 10, color: C.muted, marginBottom: 4 }}>
+                  <span>{data.trades} işlem</span>
+                  <span>WR: {data.win_rate.toFixed(1)}%</span>
+                </div>
+                <div style={{ height: 4, background: "#1e3a5f", borderRadius: 2 }}>
+                  <div style={{ width: `${data.win_rate}%`, height: "100%", background: data.win_rate >= 50 ? C.accent : C.red, borderRadius: 2 }} />
+                </div>
+              </div>
+            ))
+          }
+        </div>
+      </div>
+
+      {/* Daily P&L Bar Chart */}
+      {curve.length > 0 && (
+        <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 8, padding: 16, marginTop: 16 }}>
+          <div style={{ fontSize: 12, fontWeight: 700, color: C.text, marginBottom: 12 }}>Günlük P&L</div>
+          <div style={{ display: "flex", alignItems: "flex-end", gap: 2, height: 80 }}>
+            {curve.slice(-60).map((d: any, i: number) => {
+              const maxAbs = Math.max(...pnls.map(Math.abs), 1);
+              const h = Math.abs(d.pnl) / maxAbs * 70;
+              return (
+                <div key={i} title={`${d.date}: ${d.pnl >= 0 ? "+" : ""}${d.pnl.toFixed(2)}`}
+                  style={{ flex: 1, height: h, minHeight: 2, background: d.pnl >= 0 ? C.accent : C.red, borderRadius: 1, opacity: 0.85 }} />
+              );
+            })}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
