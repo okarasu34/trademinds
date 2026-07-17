@@ -54,9 +54,11 @@ async def create_backtest(
         raise HTTPException(status_code=404, detail="Strategy not found")
 
     # Validate date range
-    if body.end_date <= body.start_date:
+    start = body.start_date.replace(tzinfo=None)
+    end = body.end_date.replace(tzinfo=None)
+    if end <= start:
         raise HTTPException(status_code=400, detail="end_date must be after start_date")
-    days = (body.end_date - body.start_date).days
+    days = (end - start).days
     if days < 7:
         raise HTTPException(status_code=400, detail="Minimum backtest period is 7 days")
 
@@ -66,8 +68,8 @@ async def create_backtest(
         name=body.name,
         symbol=body.symbol,
         timeframe=body.timeframe,
-        start_date=body.start_date,
-        end_date=body.end_date,
+        start_date=body.start_date.replace(tzinfo=None),
+        end_date=body.end_date.replace(tzinfo=None),
         initial_balance=body.initial_balance,
         currency=body.currency,
         status="pending",
