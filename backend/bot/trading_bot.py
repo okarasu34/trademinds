@@ -157,11 +157,15 @@ class MultiDivergenceStrategy:
         linreg_pos     = ind.get("linreg_position", "inside")
         above_midline  = ind.get("above_rsi_midline")
 
-        min_div = params.get("min_divergence_count", 2)
+        min_div = params.get("min_divergence_count", 3)  # 2'den 3'e çıkarıldı
 
         # ── Bullish Divergence ──
         if bull_count >= min_div:
             confidence = 0.55 + bull_count * 0.05
+
+            # T3 yükselmiyor ama BUY sinyali — trend çelişkisi, atla
+            if t3_rising is False:
+                return None
 
             # Fibonacci desteği
             if near_fibo in ("fibo_382", "fibo_500", "fibo_618"):
@@ -170,7 +174,9 @@ class MultiDivergenceStrategy:
             # RSI oversold bölgesi
             if rsi < 40:
                 confidence += 0.05
-            
+            elif rsi > 60:
+                confidence -= 0.08  # RSI yüksekken BUY riskli
+
             # MACD crossover teyidi
             if macd_cross == "bullish":
                 confidence += 0.05
@@ -186,7 +192,7 @@ class MultiDivergenceStrategy:
             # Linear Regression trend teyidi
             if linreg_trend == "bullish" and linreg_strong:
                 confidence += 0.05
-            
+
             # Linear Regression alt bandında
             if linreg_pos == "below_lower":
                 confidence += 0.03
@@ -209,12 +215,18 @@ class MultiDivergenceStrategy:
         if bear_count >= min_div:
             confidence = 0.55 + bear_count * 0.05
 
+            # T3 düşmüyor ama SELL sinyali — trend çelişkisi, atla
+            if t3_rising is True:
+                return None
+
             if near_fibo in ("fibo_618", "fibo_786", "fibo_1000"):
                 confidence += 0.08
 
             if rsi > 60:
                 confidence += 0.05
-            
+            elif rsi < 40:
+                confidence -= 0.08  # RSI düşükken SELL riskli
+
             if macd_cross == "bearish":
                 confidence += 0.05
 
