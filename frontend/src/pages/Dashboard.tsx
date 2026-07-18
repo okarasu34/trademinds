@@ -1165,10 +1165,11 @@ function PerformancePanel() {
 
   useEffect(() => {
     setLoading(true);
+    const days = period === "7d" ? 7 : period === "30d" ? 30 : period === "90d" ? 90 : 365;
     Promise.all([
       tradesApi.getStats(period),
-      import("../utils/api").then(m => m.default.get("/dashboard/equity-curve", { params: { days: period === "7d" ? 7 : period === "30d" ? 30 : period === "90d" ? 90 : 365 } })),
-      import("../utils/api").then(m => m.default.get("/dashboard/market-breakdown")),
+      import("../utils/api").then(m => m.default.get("/dashboard/equity-curve", { params: { days } })),
+      import("../utils/api").then(m => m.default.get("/dashboard/market-breakdown", { params: { days } })),
     ]).then(([s, c, b]) => {
       setStats(s.data);
       setCurve(Array.isArray(c.data) ? c.data : []);
@@ -1186,7 +1187,7 @@ function PerformancePanel() {
 
   const periods = ["7d", "30d", "90d", "1y"];
 
-  if (loading) return <div style={{ padding: 40, textAlign: "center", color: C.muted }}>Yükleniyor...</div>;
+  if (loading) return <div style={{ padding: 40, textAlign: "center", color: C.muted }}>Loading...</div>;
 
   const pnls = curve.map((c: any) => c.pnl);
   const cumulative = curve.map((c: any) => c.cumulative);
@@ -1209,14 +1210,14 @@ function PerformancePanel() {
 
       {/* Stats grid */}
       <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 12, marginBottom: 20 }}>
-        {statCard("Toplam İşlem", stats?.total_trades ?? "-")}
+        {statCard("Total Trades", stats?.total_trades ?? "-")}
         {statCard("Win Rate", stats?.win_rate != null ? `${stats.win_rate.toFixed(1)}%` : "-", stats?.win_rate >= 50 ? C.green : C.red)}
         {statCard("Net P&L", stats?.total_pnl != null ? `${stats.total_pnl >= 0 ? "+" : ""}${stats.total_pnl.toFixed(2)} EUR` : "-", stats?.total_pnl >= 0 ? C.green : C.red)}
         {statCard("Profit Factor", stats?.profit_factor != null ? stats.profit_factor.toFixed(2) : "-", stats?.profit_factor >= 1 ? C.green : C.red)}
         {statCard("Sharpe Ratio", stats?.sharpe_ratio != null ? stats.sharpe_ratio.toFixed(2) : "-")}
         {statCard("Max Drawdown", stats?.max_drawdown != null ? `${stats.max_drawdown.toFixed(2)}%` : "-", C.red)}
-        {statCard("Kazanan", stats?.winning_trades ?? "-", C.green)}
-        {statCard("Kaybeden", stats?.losing_trades ?? "-", C.red)}
+        {statCard("Winners", stats?.winning_trades ?? "-", C.green)}
+        {statCard("Losers", stats?.losing_trades ?? "-", C.red)}
       </div>
 
       <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr", gap: 16 }}>
@@ -1224,7 +1225,7 @@ function PerformancePanel() {
         <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 8, padding: 16 }}>
           <div style={{ fontSize: 12, fontWeight: 700, color: C.text, marginBottom: 12 }}>Equity Curve</div>
           {curve.length === 0
-            ? <div style={{ textAlign: "center", color: C.muted, fontSize: 12, padding: 40 }}>Bu dönemde işlem yok</div>
+            ? <div style={{ textAlign: "center", color: C.muted, fontSize: 12, padding: 40 }}>No trades in this period</div>
             : (
               <svg width="100%" height={H} viewBox={`0 0 ${curve.length} ${H}`} preserveAspectRatio="none">
                 {(() => {
@@ -1249,9 +1250,9 @@ function PerformancePanel() {
 
         {/* Market Breakdown */}
         <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 8, padding: 16 }}>
-          <div style={{ fontSize: 12, fontWeight: 700, color: C.text, marginBottom: 12 }}>Market Bazlı</div>
+          <div style={{ fontSize: 12, fontWeight: 700, color: C.text, marginBottom: 12 }}>By Market</div>
           {Object.keys(breakdown).length === 0
-            ? <div style={{ textAlign: "center", color: C.muted, fontSize: 12, padding: 20 }}>Veri yok</div>
+            ? <div style={{ textAlign: "center", color: C.muted, fontSize: 12, padding: 20 }}>No data</div>
             : Object.entries(breakdown).map(([market, data]: [string, any]) => (
               <div key={market} style={{ marginBottom: 12 }}>
                 <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
@@ -1261,7 +1262,7 @@ function PerformancePanel() {
                   </span>
                 </div>
                 <div style={{ display: "flex", gap: 8, fontSize: 10, color: C.muted, marginBottom: 4 }}>
-                  <span>{data.trades} işlem</span>
+                  <span>{data.trades} trades</span>
                   <span>WR: {data.win_rate.toFixed(1)}%</span>
                 </div>
                 <div style={{ height: 4, background: "#1e3a5f", borderRadius: 2 }}>
@@ -1276,7 +1277,7 @@ function PerformancePanel() {
       {/* Daily P&L Bar Chart */}
       {curve.length > 0 && (
         <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 8, padding: 16, marginTop: 16 }}>
-          <div style={{ fontSize: 12, fontWeight: 700, color: C.text, marginBottom: 12 }}>Günlük P&L</div>
+          <div style={{ fontSize: 12, fontWeight: 700, color: C.text, marginBottom: 12 }}>Daily P&L</div>
           <div style={{ display: "flex", alignItems: "flex-end", gap: 2, height: 80 }}>
             {curve.slice(-60).map((d: any, i: number) => {
               const maxAbs = Math.max(...pnls.map(Math.abs), 1);

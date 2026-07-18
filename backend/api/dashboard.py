@@ -160,14 +160,17 @@ async def get_equity_curve(
 
 @router.get("/market-breakdown")
 async def get_market_breakdown(
+    days: int = 30,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    since = datetime.utcnow() - timedelta(days=days)
     r = await db.execute(
         select(Trade).where(
             Trade.user_id == user.id,
             Trade.status == OrderStatus.CLOSED,
             Trade.pnl.isnot(None),
+            Trade.closed_at >= since,
         )
     )
     trades = r.scalars().all()
