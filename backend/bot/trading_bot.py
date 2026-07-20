@@ -73,7 +73,7 @@ class Signal:
     strategy_id: Optional[str] = None
 
     def idempotency_key(self) -> str:
-        bucket = int(self.timestamp.timestamp() / 300)
+        bucket = int(self.timestamp.timestamp() / 3600)  # 5dk → 1 saat
         raw = f"{self.user_id}:{self.symbol}:{self.side.value}:{bucket}"
         return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
@@ -1402,6 +1402,14 @@ class TradingBot:
             return
 
         # 7. Position Guard
+        # ── Redis cache kontrolü (çift pozisyon önleme) ──
+        try:
+            if await OrderedSymbolCache.exists(signal.user_id, symbol):
+                logger.info(f"[{symbol}] BLOCKED by Redis cache (already ordered recently)")
+                return
+        except Exception as e:
+            logger.warning(f"[{symbol}] Redis check failed: {e}")
+
         ok, msg = PositionGuard.check_correlation(signal, ctx)
         if not ok:
             logger.info(f"[{symbol}] REJECTED by CorrelationGuard: {msg}")
@@ -1433,7 +1441,7 @@ class TradingBot:
         if ok:
             logger.success(f"[{symbol}] ORDER PLACED: {msg}")
             PositionGuard.register_open(signal, ctx)
-            await OrderedSymbolCache.add(signal.user_id, symbol, ttl=3600)
+            await OrderedSymbolCache.add(signal.user_id, symbol, ttl=14400)  # 1h → 4h
             log = AISignalLog(
                 user_id     = signal.user_id,
                 symbol      = signal.symbol,
